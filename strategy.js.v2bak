@@ -1,0 +1,584 @@
+/**
+ * strategy.js — Pure strategy logic (no I/O, fully testable)
+ *
+ * STRATEGY SOURCES:
+ *   Video 1 — Sowmya: S&D zones (4H→1H→15m map, 5m execute)
+ *             Footprint delta confirmation: trapped buyers/sellers
+ *             4 setups: (bull candle + neg delta), (bear candle + pos delta),
+ *             B-shape at demand, P-shape at supply
+ *   Video 2 — Dealer's Edge: GEX anchor/flip/walls, VEX volatility pressure,
+ *             regime context (pos GEX = mean-revert, neg GEX = expand)
+ *
+ * ADDITIONAL CONFLUENCE (our additions to improve win rate):
+ *   - Session VWAP + Prior Day VWAP (mentioned in video 2 live demo)
+ *   - Volume POC alignment (natural extension of B/P shape theory)
+ *   - ATR expansion filter (confirms negative GEX momentum environment)
+ *   - NY session time gating (9:30-11:30 AM, 1:30-3:30 PM ET — Sowmya's timing)
+ */
+
+// ─── MATH HELPERS ────────────────────────────────────────────────────────────
+function ema(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) e = prices[i] * k + e * (1 - k);
+  return e;
+}
+
+function sma(arr, period) {
+  if (arr.length < period) return null;
+  return arr.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+function atr(highs, lows, closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < closes.length; i++) {
+    trs.push(Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    ));
+  }
+  return sma(trs, period);
+}
+
+function vwap(prices, volumes) {
+  let pv = 0, v = 0;
+  for (let i = 0; i < prices.length; i++) { pv += prices[i] * volumes[i]; v += volumes[i]; }
+  return v > 0 ? pv / v : null;
+}
+
+function stddev(arr) {
+  const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+  return Math.sqrt(arr.reduce((a, b) => a + (b - m) ** 2, 0) / arr.length);
+}
+
+// ─── DELTA (approximated from OHLCV) ─────────────────────────────────────────
+// Real footprint requires tick data (separate software per Sowmya).
+// Best approximation with OHLCV: use close-to-open direction × volume,
+// adjusted by wick ratio to estimate buyer/seller aggression.
+function calcDelta(open, high, low, close, volume) {
+  const range = high - low || 0.0001;
+  const buyFrac  = (close - low)  / range;   // fraction of range that closed "up"
+  const sellFrac = (high - close) / range;   // fraction that closed "down"
+  const buyVol   = volume * buyFrac;
+  const sellVol  = volume * sellFrac;
+  return buyVol - sellVol;  // positive = net buyers, negative = net sellers
+}
+
+// Per-bar delta series
+function deltaSeeries(opens, highs, lows, closes, volumes) {
+  return closes.map((c, i) => calcDelta(opens[i], highs[i], lows[i], c, volumes[i]));
+}
+
+// ─── SUPPLY & DEMAND ZONE DETECTION (Sowmya method) ─────────────────────────
+// Zones: impulse → rest candle(s) → impulse (or rest → impulse)
+// Uses 4H or 1H bars as the "zone map"
+function detectSDZones(opens, highs, lows, closes, volumes, lookback = 30) {
+  const demand = [], supply = [];
+  const n = closes.length;
+
+  for (let i = 2; i < n - 1; i++) {
+    const range    = highs[i] - lows[i];
+    const body     = Math.abs(closes[i] - opens[i]);
+    const bodyRat  = range > 0 ? body / range : 0;
+
+    // "Rest" candle: small body, can have wicks (base candle)
+    const isRest   = (prev) => {
+      const pr = highs[prev] - lows[prev];
+      const pb = Math.abs(closes[prev] - opens[prev]);
+      return pr > 0 && pb / pr < 0.5;
+    };
+
+    // Impulse candle: large body (>55% of range), directional
+    const isBullImpulse = closes[i] > opens[i] && bodyRat > 0.55;
+    const isBearImpulse = closes[i] < opens[i] && bodyRat > 0.55;
+
+    // Demand: rest candle → strong bull impulse (Sowmya: mark rest zone top+bottom with WICKS)
+    if (isRest(i - 1) && isBullImpulse) {
+      // Zone spans the full rest candle including wicks (Sowmya emphasises wicks are key)
+      demand.push({
+        top:     highs[i - 1],
+        bottom:  lows[i - 1],
+        formed:  i,
+        retests: 0,
+        valid:   true,
+        strength: body / range,  // impulse strength
+      });
+    }
+
+    // Supply: rest candle → strong bear impulse
+    if (isRest(i - 1) && isBearImpulse) {
+      supply.push({
+        top:     highs[i - 1],
+        bottom:  lows[i - 1],
+        formed:  i,
+        retests: 0,
+        valid:   true,
+        strength: body / range,
+      });
+    }
+  }
+
+  // Invalidate zones that have been "mitigated" (price closed inside and through)
+  const last = closes[closes.length - 1];
+  const validDemand = demand
+    .filter(z => z.top < last * 1.001)      // demand below current price
+    .filter(z => z.valid)
+    .slice(-6);
+  const validSupply = supply
+    .filter(z => z.bottom > last * 0.999)  // supply above current price
+    .filter(z => z.valid)
+    .slice(-6);
+
+  return { demand: validDemand, supply: validSupply };
+}
+
+// Is price currently AT a zone?
+function priceAtZone(price, zones) {
+  for (const z of zones.demand) {
+    // Allow 0.1% cushion below zone bottom (wick into zone)
+    if (price >= z.bottom * 0.999 && price <= z.top * 1.002) {
+      return { hit: true, type: 'demand', zone: z };
+    }
+  }
+  for (const z of zones.supply) {
+    if (price >= z.bottom * 0.998 && price <= z.top * 1.001) {
+      return { hit: true, type: 'supply', zone: z };
+    }
+  }
+  return { hit: false, type: null, zone: null };
+}
+
+// ─── GEX SELF-CALCULATION (from Alpaca option chain) ─────────────────────────
+// Same approach as v1 bot: gamma × OI × 100 × spot
+// Returns synthetic GEX levels: anchor, flip, walls
+function calcGEXLevels(optionChain, spotPrice) {
+  if (!optionChain || !optionChain.length) return null;
+
+  const strikeMap = {};
+
+  for (const contract of optionChain) {
+    const strike = contract.strike_price;
+    const gamma  = contract.greeks?.gamma  || 0;
+    const oi     = contract.open_interest  || 0;
+    const type   = contract.type;           // 'call' | 'put'
+
+    if (!strikeMap[strike]) strikeMap[strike] = { call: 0, put: 0, net: 0, strike };
+
+    const gexContrib = gamma * oi * 100 * spotPrice;
+    if (type === 'call') {
+      strikeMap[strike].call += gexContrib;
+      strikeMap[strike].net  += gexContrib;
+    } else {
+      strikeMap[strike].put  += gexContrib;
+      strikeMap[strike].net  -= gexContrib;  // put GEX is negative (dealers short)
+    }
+  }
+
+  const strikes = Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
+  const totalGEX = strikes.reduce((s, x) => s + x.net, 0);
+  const isPositiveGEX = totalGEX > 0;
+
+  // Anchor: strike with highest absolute GEX (price magnet)
+  const anchor = strikes.reduce((m, x) => Math.abs(x.net) > Math.abs(m.net) ? x : m, strikes[0]);
+
+  // Flip: first strike where GEX sign changes (below = negative, above = positive)
+  let flip = null;
+  for (let i = 1; i < strikes.length; i++) {
+    if (Math.sign(strikes[i].net) !== Math.sign(strikes[i - 1].net)) {
+      // Flip is at the strike closer to spot
+      flip = Math.abs(strikes[i].strike - spotPrice) < Math.abs(strikes[i - 1].strike - spotPrice)
+        ? strikes[i] : strikes[i - 1];
+      break;
+    }
+  }
+
+  // Defense walls: top 4 strikes by absolute GEX magnitude (reaction zones)
+  const walls = [...strikes]
+    .sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
+    .slice(0, 6);
+
+  // Nearest wall above and below spot
+  const wallAbove = walls.filter(w => w.strike > spotPrice).sort((a, b) => a.strike - b.strike)[0];
+  const wallBelow = walls.filter(w => w.strike < spotPrice).sort((a, b) => b.strike - a.strike)[0];
+
+  // GEX rating: ratio of positive to negative GEX strikes near spot (±5 strikes)
+  const nearStrikes = strikes.filter(s => Math.abs(s.strike - spotPrice) <= 5);
+  const nearPos = nearStrikes.filter(s => s.net > 0).reduce((a, s) => a + s.net, 0);
+  const nearNeg = nearStrikes.filter(s => s.net < 0).reduce((a, s) => a + s.net, 0);
+  const gexRating = nearPos + nearNeg;  // net near-spot GEX
+
+  return {
+    totalGEX,
+    isPositiveGEX,
+    gexRating,
+    anchor:    anchor.strike,
+    flip:      flip?.strike || null,
+    wallAbove: wallAbove?.strike || null,
+    wallBelow: wallBelow?.strike || null,
+    walls:     walls.map(w => ({ strike: w.strike, net: w.net })),
+    strikes,
+    regime: isPositiveGEX ? 'CONTROLLED' : 'EXPANSIVE',
+  };
+}
+
+// ─── FOOTPRINT DELTA SETUPS (Sowmya's 4 setups) ──────────────────────────────
+// Returns the setup type if confirmed, null otherwise
+// bars5m: last N bars on 5m timeframe
+function detectFootprintSetup(opens, highs, lows, closes, volumes, zoneHit) {
+  const last = closes.length - 1;
+  const delta = deltaSeeries(opens, highs, lows, closes, volumes);
+  const lastDelta  = delta[last];
+  const prevDelta  = delta[last - 1] || 0;
+
+  const lastBull   = closes[last] > opens[last];
+  const lastBear   = closes[last] < opens[last];
+  const lastRange  = highs[last] - lows[last];
+  const lastBody   = Math.abs(closes[last] - opens[last]);
+
+  // Only act at a zone
+  if (!zoneHit.hit) return null;
+
+  const setups = [];
+
+  // SETUP 1 (A-grade): Demand zone + bull candle + NEGATIVE delta
+  // = Sellers trapped despite bullish close → strong demand confirmation
+  if (zoneHit.type === 'demand' && lastBull && lastDelta < 0) {
+    setups.push({
+      type:      'SETUP_1',
+      direction: 'CALL',
+      grade:     'A',
+      label:     'Bull+NegDelta@Demand',
+      desc:       'Bullish candle, sellers trapped at demand → long',
+      delta:      lastDelta,
+      entryTrigger: 'above high of footprint candle',
+      stopRef:   lows[last],
+    });
+  }
+
+  // SETUP 2 (A-grade): Supply zone + bear candle + POSITIVE delta
+  // = Buyers trapped despite bearish close → strong supply confirmation
+  if (zoneHit.type === 'supply' && lastBear && lastDelta > 0) {
+    setups.push({
+      type:      'SETUP_2',
+      direction: 'PUT',
+      grade:     'A',
+      label:     'Bear+PosDelta@Supply',
+      desc:       'Bearish candle, buyers trapped at supply → short',
+      delta:      lastDelta,
+      entryTrigger: 'below low of footprint candle',
+      stopRef:   highs[last],
+    });
+  }
+
+  // SETUP 3: Demand zone + B-shape (volume concentrated at lows, thin at highs)
+  // Approximate B-shape: volume spike + low close relative to range + prior wick
+  const bShape = detectBShape(opens, highs, lows, closes, volumes, last);
+  if (zoneHit.type === 'demand' && bShape) {
+    const grade = lastDelta < 0 ? 'A+' : 'B';  // A+ if delta also confirms
+    setups.push({
+      type:      'SETUP_3',
+      direction: 'CALL',
+      grade,
+      label:     `BShape@Demand${grade === 'A+' ? '+Delta' : ''}`,
+      desc:       'B-shape (vol at lows) at demand zone → limit long at high-vol node',
+      delta:      lastDelta,
+      entryTrigger: 'limit order at high-volume node (zone top)',
+      stopRef:   lows[last],
+    });
+  }
+
+  // SETUP 4: Supply zone + P-shape (volume concentrated at highs, thin at lows)
+  const pShape = detectPShape(opens, highs, lows, closes, volumes, last);
+  if (zoneHit.type === 'supply' && pShape) {
+    const grade = lastDelta > 0 ? 'A+' : 'B';
+    setups.push({
+      type:      'SETUP_4',
+      direction: 'PUT',
+      grade,
+      label:     `PShape@Supply${grade === 'A+' ? '+Delta' : ''}`,
+      desc:       'P-shape (vol at highs) at supply zone → limit short at high-vol node',
+      delta:      lastDelta,
+      entryTrigger: 'limit order at high-volume node (zone bottom)',
+      stopRef:   highs[last],
+    });
+  }
+
+  if (!setups.length) return null;
+
+  // Return highest-grade setup
+  const gradeOrder = { 'A+': 3, 'A': 2, 'B': 1 };
+  setups.sort((a, b) => (gradeOrder[b.grade] || 0) - (gradeOrder[a.grade] || 0));
+  return setups[0];
+}
+
+// B-shape: volume concentrated at bottom of candle (buying pressure at lows)
+// Proxy: large wick below + volume above average + close > midpoint
+function detectBShape(opens, highs, lows, closes, volumes, idx) {
+  const c = closes[idx], o = opens[idx], h = highs[idx], l = lows[idx], v = volumes[idx];
+  const range    = h - l || 0.0001;
+  const lowerWick = (Math.min(c, o) - l) / range;   // lower wick fraction
+  const closePos  = (c - l) / range;                 // where close sits in range
+  const avgVol    = sma(volumes.slice(Math.max(0, idx - 10), idx), 10) || v;
+  return lowerWick > 0.25 && closePos > 0.5 && v > avgVol * 0.9;
+}
+
+// P-shape: volume concentrated at top of candle (selling pressure at highs)
+// Proxy: large wick above + volume above average + close < midpoint
+function detectPShape(opens, highs, lows, closes, volumes, idx) {
+  const c = closes[idx], o = opens[idx], h = highs[idx], l = lows[idx], v = volumes[idx];
+  const range    = h - l || 0.0001;
+  const upperWick = (h - Math.max(c, o)) / range;  // upper wick fraction
+  const closePos  = (c - l) / range;
+  const avgVol    = sma(volumes.slice(Math.max(0, idx - 10), idx), 10) || v;
+  return upperWick > 0.25 && closePos < 0.5 && v > avgVol * 0.9;
+}
+
+// ─── GEX CONFLUENCE SCORER (Video 2 process) ─────────────────────────────────
+// Returns score 0-100 and regime context
+function scoreGEXConfluence(gex, price, direction) {
+  if (!gex) return { score: 0, details: [] };
+
+  let score = 0;
+  const details = [];
+
+  // 1. Price vs Flip (regime check — most important per video 2)
+  if (gex.flip) {
+    const aboveFlip = price > gex.flip;
+    if (direction === 'CALL' && aboveFlip) {
+      score += 25;
+      details.push({ label: 'Above Flip', color: 'green', weight: 25 });
+    } else if (direction === 'PUT' && !aboveFlip) {
+      score += 25;
+      details.push({ label: 'Below Flip', color: 'green', weight: 25 });
+    } else {
+      details.push({ label: 'Counter-Regime', color: 'red', weight: 0 });
+    }
+  }
+
+  // 2. Price vs Anchor (magnet — are we trading toward or away from anchor?)
+  if (gex.anchor) {
+    const towardAnchor = direction === 'CALL'
+      ? price < gex.anchor
+      : price > gex.anchor;
+    if (towardAnchor) {
+      score += 15;
+      details.push({ label: `Toward Anchor ${gex.anchor}`, color: 'green', weight: 15 });
+    }
+  }
+
+  // 3. GEX regime alignment
+  if (gex.regime === 'EXPANSIVE') {
+    // Negative GEX = momentum follows through → good for directional options
+    score += 20;
+    details.push({ label: 'Negative GEX (Expansive)', color: 'green', weight: 20 });
+  } else {
+    // Positive GEX = mean-revert → only take trades at extremes
+    score += 5;
+    details.push({ label: 'Positive GEX (Controlled)', color: 'yellow', weight: 5 });
+  }
+
+  // 4. Nearest wall alignment (are we near a reaction wall in right direction?)
+  const nearWall = direction === 'CALL' ? gex.wallAbove : gex.wallBelow;
+  if (nearWall) {
+    const dist = Math.abs(nearWall - price) / price;
+    if (dist < 0.005) {  // within 0.5% of wall
+      score += 20;
+      details.push({ label: `At GEX Wall ${nearWall}`, color: 'green', weight: 20 });
+    } else if (dist < 0.015) {
+      score += 10;
+      details.push({ label: `Near GEX Wall ${nearWall}`, color: 'yellow', weight: 10 });
+    }
+  }
+
+  // 5. SPY/SPX/QQQ alignment (video 2: all three should agree)
+  // Encoded as gex.multiTickerAligned if provided externally
+  if (gex.multiTickerAligned === true) {
+    score += 20;
+    details.push({ label: 'SPY/SPX/QQQ Aligned', color: 'green', weight: 20 });
+  }
+
+  return { score: Math.min(score, 100), details, regime: gex.regime };
+}
+
+// ─── ADDITIONAL CONFLUENCE (our enhancements) ────────────────────────────────
+function scoreAdditionalConfluence(opens, highs, lows, closes, volumes, direction) {
+  const last = closes.length - 1;
+  let score = 0;
+  const details = [];
+
+  // 1. Session VWAP (Sowmya + video 2 explicitly use VWAP as regime filter)
+  const sessionVWAP = vwap(closes, volumes);
+  if (sessionVWAP) {
+    const aboveVWAP = closes[last] > sessionVWAP;
+    if (direction === 'CALL' && aboveVWAP) {
+      score += 15; details.push({ label: 'Above Session VWAP', color: 'green', weight: 15 });
+    } else if (direction === 'PUT' && !aboveVWAP) {
+      score += 15; details.push({ label: 'Below Session VWAP', color: 'green', weight: 15 });
+    } else {
+      details.push({ label: 'Counter VWAP', color: 'red', weight: 0 });
+    }
+  }
+
+  // 2. EMA trend alignment (supporting structure)
+  const ema9  = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+  if (ema9 && ema21) {
+    if (direction === 'CALL' && ema9 > ema21 && closes[last] > ema9) {
+      score += 10; details.push({ label: 'EMA Bull Stack', color: 'green', weight: 10 });
+    } else if (direction === 'PUT' && ema9 < ema21 && closes[last] < ema9) {
+      score += 10; details.push({ label: 'EMA Bear Stack', color: 'green', weight: 10 });
+    }
+  }
+
+  // 3. ATR expansion filter (confirms negative GEX momentum environment)
+  const atrVal  = atr(highs, lows, closes, 14);
+  const atrSma  = atrVal ? sma(closes.map((_, i) =>
+    i >= 14 ? atr(highs.slice(0, i+1), lows.slice(0, i+1), closes.slice(0, i+1), 14) || 0 : 0
+  ).filter(Boolean), 5) : null;
+  if (atrVal && atrSma && atrVal > atrSma * 1.1) {
+    score += 10; details.push({ label: 'ATR Expanding', color: 'green', weight: 10 });
+  }
+
+  // 4. Volume confirmation (bar volume vs avg — high vol at zone = institutional)
+  const avgVol  = sma(volumes.slice(0, -1), Math.min(20, volumes.length - 1));
+  if (avgVol && volumes[last] > avgVol * 1.2) {
+    score += 10; details.push({ label: 'Above-Avg Volume', color: 'green', weight: 10 });
+  }
+
+  // 5. Prior candle structure (no entry mid-range per video 2 mistake #2)
+  const prevRange  = highs[last - 1] - lows[last - 1];
+  const lastRange  = highs[last]     - lows[last];
+  const contracting = lastRange < prevRange * 0.8;
+  if (contracting) {
+    score += 5; details.push({ label: 'Candles Contracting (tight entry)', color: 'yellow', weight: 5 });
+  }
+
+  return { score: Math.min(score, 50), details, sessionVWAP, ema9, ema21, atr: atrVal };
+}
+
+// ─── NY SESSION TIMING FILTER (Sowmya: trade after NY open, video 2: live session) ──
+function isValidTradingTime(etHour, etMinute) {
+  const mins = etHour * 60 + etMinute;
+  // Window 1: 9:30 AM – 11:30 AM ET (NY open run — Sowmya's primary window)
+  // Window 2: 1:30 PM – 3:30 PM ET  (afternoon session, avoid last 15m)
+  const window1 = mins >= 9 * 60 + 30  && mins < 11 * 60 + 30;
+  const window2 = mins >= 13 * 60 + 30 && mins < 15 * 60 + 30;
+  return window1 || window2;
+}
+
+// ─── MASTER SIGNAL EVALUATOR ─────────────────────────────────────────────────
+// Combines all three layers into a final signal
+function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute }) {
+  const result = {
+    direction:   'NEUTRAL',
+    confidence:  0,
+    grade:       null,
+    setup:       null,
+    zoneHit:     null,
+    zones:       null,
+    gexAnalysis: null,
+    addlConf:    null,
+    meta:        {},
+    timestamp:   new Date().toISOString(),
+    tradeable:   false,
+    rejectReasons: [],
+  };
+
+  // ── Layer 0: Time filter ──────────────────────────────────────────────────
+  if (!isValidTradingTime(etHour, etMinute)) {
+    result.rejectReasons.push('Outside NY session windows (9:30-11:30, 13:30-15:30 ET)');
+    return result;
+  }
+
+  if (!bars15m?.length || !bars5m?.length || bars5m.length < 20) {
+    result.rejectReasons.push('Insufficient bar data');
+    return result;
+  }
+
+  const c15 = bars15m.map(b => b.c), h15 = bars15m.map(b => b.h);
+  const l15 = bars15m.map(b => b.l), o15 = bars15m.map(b => b.o), v15 = bars15m.map(b => b.v);
+
+  const c5  = bars5m.map(b => b.c), h5  = bars5m.map(b => b.h);
+  const l5  = bars5m.map(b => b.l), o5  = bars5m.map(b => b.o), v5  = bars5m.map(b => b.v);
+
+  const lastPrice = c5[c5.length - 1];
+  const atrVal    = atr(h5, l5, c5) || lastPrice * 0.003;
+
+  // ── Layer 1: S&D Zone map (15m) ───────────────────────────────────────────
+  const zones = detectSDZones(o15, h15, l15, c15, v15);
+  result.zones = zones;
+  const zoneHit = priceAtZone(lastPrice, zones);
+  result.zoneHit = zoneHit;
+
+  // ── Layer 2: Footprint setup (5m) ─────────────────────────────────────────
+  const setup = detectFootprintSetup(o5, h5, l5, c5, v5, zoneHit);
+  result.setup = setup;
+
+  if (!setup) {
+    result.rejectReasons.push('No footprint setup (no trapped participants at zone)');
+    return result;
+  }
+
+  const direction = setup.direction;
+  result.direction = direction;
+
+  // ── Layer 3: GEX confluence (Video 2 process) ─────────────────────────────
+  const gexScore = scoreGEXConfluence(gexData, lastPrice, direction);
+  result.gexAnalysis = { ...gexData, ...gexScore };
+
+  // ── Layer 4: Additional confluence ───────────────────────────────────────
+  const addlConf = scoreAdditionalConfluence(o5, h5, l5, c5, v5, direction);
+  result.addlConf = addlConf;
+
+  // ── Final confidence calculation ──────────────────────────────────────────
+  // Weights: Footprint setup (40%) + GEX (35%) + Additional (25%)
+  const setupWeight = setup.grade === 'A+' ? 40 : setup.grade === 'A' ? 32 : 22;
+  const gexWeight   = gexScore.score * 0.35;
+  const addlWeight  = addlConf.score * 0.50;
+
+  result.confidence = Math.min(Math.round(setupWeight + gexWeight + addlWeight), 100);
+  result.grade      = setup.grade;
+  result.meta       = {
+    lastPrice,
+    atr:          atrVal,
+    setupLabel:   setup.label,
+    setupDesc:    setup.desc,
+    delta:        setup.delta,
+    stopRef:      setup.stopRef,
+    sessionVWAP:  addlConf.sessionVWAP,
+    ema9:         addlConf.ema9,
+    ema21:        addlConf.ema21,
+    gexRegime:    gexData?.regime || 'UNKNOWN',
+    anchor:       gexData?.anchor,
+    flip:         gexData?.flip,
+    wallAbove:    gexData?.wallAbove,
+    wallBelow:    gexData?.wallBelow,
+  };
+
+  // ── Tradeable threshold ───────────────────────────────────────────────────
+  // Require: zone hit + setup + minimum confidence
+  result.tradeable = (
+    zoneHit.hit &&
+    setup !== null &&
+    result.confidence >= 60  // adjustable via config
+  );
+
+  if (!zoneHit.hit) result.rejectReasons.push('No zone hit — price not at S&D level');
+
+  return result;
+}
+
+module.exports = {
+  evaluateSignal,
+  detectSDZones,
+  calcGEXLevels,
+  detectFootprintSetup,
+  scoreGEXConfluence,
+  scoreAdditionalConfluence,
+  isValidTradingTime,
+  vwap, ema, atr, sma,
+  deltaSeeries,
+};

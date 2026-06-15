@@ -1,0 +1,178 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// S&D + DELTA CONFLUENCE — Pine Script v5
+// Strategy based on: Sowmya (Video 1) + Dealer's Edge GEX (Video 2)
+//
+// SETUP DETECTION (Sowmya's 4 setups):
+//   Setup 1: Demand zone + Bull candle + Negative delta → CALL
+//   Setup 2: Supply zone + Bear candle + Positive delta → PUT
+//   Setup 3: Demand zone + B-shape (vol at lows) → CALL
+//   Setup 4: Supply zone + P-shape (vol at highs) → PUT
+//   A+ grade: Setup 1+3 or 2+4 together
+//
+// Add to SPY 5-minute chart
+// Webhook alerts → Railway bot endpoint
+// ─────────────────────────────────────────────────────────────────────────────
+//@version=5
+indicator("S&D + Delta Footprint (Sowmya + GEX)", overlay=true, max_boxes_count=50)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+g1 = "Supply & Demand Zones"
+zone_body_min  = input.float(0.55, "Min Impulse Body Ratio", group=g1, step=0.05)
+show_zones     = input.bool(true,  "Show Zones",             group=g1)
+
+g2 = "Delta Approximation"
+show_delta     = input.bool(true,  "Show Delta Labels",  group=g2)
+show_setup     = input.bool(true,  "Show Setup Markers", group=g2)
+
+g3 = "Filters"
+ema_fast       = input.int(9,      "Fast EMA",           group=g3)
+ema_slow       = input.int(21,     "Slow EMA",           group=g3)
+show_ema       = input.bool(true,  "Show EMAs",          group=g3)
+show_vwap      = input.bool(true,  "Show VWAP",          group=g3)
+min_conf       = input.int(65,     "Min Confluence %",   group=g3, minval=50, maxval=95)
+
+g4 = "Session"
+session_start  = input.session("0930-1130", "Session Window 1 (NY Open)", group=g4)
+session_start2 = input.session("1330-1530", "Session Window 2 (Afternoon)",group=g4)
+
+// ─── CALCULATIONS ─────────────────────────────────────────────────────────────
+emaF  = ta.ema(close, ema_fast)
+emaS  = ta.ema(close, ema_slow)
+vwapV = ta.vwap(close)
+atr14 = ta.atr(14)
+rsi14 = ta.rsi(close, 14)
+
+// Approximate delta: directional volume using wick proportions
+range_  = high - low
+buyFrac = range_ > 0 ? (close - low) / range_ : 0.5
+sellFrac= range_ > 0 ? (high - close) / range_ : 0.5
+approxDelta = (buyFrac - sellFrac) * volume  // positive = net buyers
+
+// Cumulative delta (reset each session)
+isNewDay = ta.change(time("D")) != 0
+cumDelta = ta.cum(isNewDay ? approxDelta : approxDelta)
+
+// CVD divergence (3-bar lookback)
+priceDir = close - close[3]
+deltaDir = cumDelta - cumDelta[3]
+bullDiverg = priceDir < 0 and deltaDir > 0   // hidden demand
+bearDiverg = priceDir > 0 and deltaDir < 0   // hidden supply
+
+// ─── ZONE DETECTION (Sowmya: rest candle → impulse candle) ───────────────────
+isRest(i) =>
+    r = high[i] - low[i]
+    b = math.abs(close[i] - open[i])
+    r > 0 and b / r < 0.45   // small body candle = base
+
+isBullImpulse = close > open and math.abs(close - open) / math.max(high - low, 0.0001) > zone_body_min
+isBearImpulse = close < open and math.abs(close - open) / math.max(high - low, 0.0001) > zone_body_min
+
+// Demand: rest[1] → bull impulse[0]
+isDemandFormed = isRest(1) and isBullImpulse and close > high[1]
+// Supply: rest[1] → bear impulse[0]
+isSupplyFormed = isRest(1) and isBearImpulse and close < low[1]
+
+// Draw zones
+if isDemandFormed and show_zones
+    box.new(bar_index[1], high[1], bar_index + 15, low[1],
+        border_color=color.new(color.green, 40),
+        bgcolor=color.new(color.green, 88),
+        border_width=1, border_style=line.style_solid)
+
+if isSupplyFormed and show_zones
+    box.new(bar_index[1], high[1], bar_index + 15, low[1],
+        border_color=color.new(color.red, 40),
+        bgcolor=color.new(color.red, 88),
+        border_width=1, border_style=line.style_solid)
+
+// ─── B/P SHAPE DETECTION ─────────────────────────────────────────────────────
+// B-shape: large lower wick + close above mid + high volume = absorption at lows
+avgVol   = ta.sma(volume, 10)
+lowerWick = (math.min(close, open) - low) / math.max(high - low, 0.0001)
+closePos  = (close - low) / math.max(high - low, 0.0001)
+upperWick = (high - math.max(close, open)) / math.max(high - low, 0.0001)
+
+bShape = lowerWick > 0.25 and closePos > 0.5 and volume > avgVol * 0.9
+pShape = upperWick > 0.25 and closePos < 0.5 and volume > avgVol * 0.9
+
+// ─── CONFLUENCE SCORING ───────────────────────────────────────────────────────
+// Bull confluence
+bull = 0
+bull := isDemandFormed ? bull + 30 : bull               // at demand zone (highest weight)
+bull := approxDelta < 0 and close > open ? bull + 25 : bull  // neg delta + bull candle = Setup 1
+bull := bShape and close > open ? bull + 15 : bull      // B-shape = Setup 3
+bull := close > vwapV ? bull + 10 : bull                // above VWAP
+bull := emaF > emaS and close > emaF ? bull + 10 : bull // EMA bull stack
+bull := bullDiverg ? bull + 10 : bull                   // CVD divergence
+
+// Bear confluence
+bear = 0
+bear := isSupplyFormed ? bear + 30 : bear
+bear := approxDelta > 0 and close < open ? bear + 25 : bear  // pos delta + bear = Setup 2
+bear := pShape and close < open ? bear + 15 : bear      // P-shape = Setup 4
+bear := close < vwapV ? bear + 10 : bear
+bear := emaF < emaS and close < emaF ? bear + 10 : bear
+bear := bearDiverg ? bear + 10 : bear
+
+// Grade
+isAplus = (approxDelta < 0 and close > open and bShape and isDemandFormed) or
+          (approxDelta > 0 and close < open and pShape and isSupplyFormed)
+isA     = (approxDelta < 0 and close > open and isDemandFormed) or
+          (approxDelta > 0 and close < open and isSupplyFormed)
+
+bullSignal = bull >= min_conf and bull > bear
+bearSignal = bear >= min_conf and bear > bull
+
+// Session filter (Sowmya: NY open windows)
+inSession1 = not na(time(timeframe.period, session_start,  "America/New_York"))
+inSession2 = not na(time(timeframe.period, session_start2, "America/New_York"))
+inSession  = inSession1 or inSession2
+
+tradeBull = bullSignal and inSession
+tradeBear = bearSignal and inSession
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+plot(show_ema ? emaF : na, "EMA 9",  color=color.new(color.aqua,   25), linewidth=1)
+plot(show_ema ? emaS : na, "EMA 21", color=color.new(color.orange, 35), linewidth=1)
+plot(show_vwap ? vwapV : na, "VWAP", color=color.new(color.yellow, 25), linewidth=1, style=plot.style_stepline)
+
+// Setup markers
+plotshape(tradeBull and show_setup, "CALL", shape.triangleup,   location.belowbar, color.new(color.lime,   0), size=size.small, text="CALL")
+plotshape(tradeBear and show_setup, "PUT",  shape.triangledown,  location.abovebar, color.new(color.red,    0), size=size.small, text="PUT")
+
+// A+ grade overlay
+plotshape(tradeBull and isAplus and show_setup, "A+CALL", shape.labelup,   location.belowbar, color.new(color.lime, 30), textcolor=color.white, text="A+", size=size.tiny)
+plotshape(tradeBear and isAplus and show_setup, "A+PUT",  shape.labeldown,  location.abovebar, color.new(color.red,  30), textcolor=color.white, text="A+", size=size.tiny)
+
+// Delta divergence labels
+if show_delta and bullDiverg
+    label.new(bar_index, low,  "↑CVD", style=label.style_label_up,   color=color.new(color.teal,   60), textcolor=color.white, size=size.tiny)
+if show_delta and bearDiverg
+    label.new(bar_index, high, "↓CVD", style=label.style_label_down, color=color.new(color.maroon, 60), textcolor=color.white, size=size.tiny)
+
+// Info table
+var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 75), border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast
+    table.cell(t,0,0,"BULL",  text_color=color.green, text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,0,str.tostring(bull)+"%", text_color=color.green, text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,0,1,"BEAR",  text_color=color.red,   text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,1,str.tostring(bear)+"%", text_color=color.red,   text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,0,2,"GRADE", text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,2,isAplus?"A+":(isA?"A":"B"), text_color=isAplus?color.lime:isA?color.aqua:color.yellow, text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,0,3,"DELTA", text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,3,str.tostring(math.round(approxDelta)), text_color=approxDelta<0?color.red:color.green, text_size=size.tiny, bgcolor=color.new(color.black,80))
+    table.cell(t,0,4,"RSI",   text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,4,str.tostring(math.round(rsi14,1)), text_color=rsi14<40?color.green:rsi14>60?color.red:color.gray, text_size=size.tiny, bgcolor=color.new(color.black,80))
+    table.cell(t,0,5,"ATR",   text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,5,str.tostring(math.round(atr14,2)), text_color=color.orange, text_size=size.tiny, bgcolor=color.new(color.black,80))
+    table.cell(t,0,6,"SES",   text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black,80))
+    table.cell(t,1,6,inSession?"✓ ACTIVE":"✗ OUT", text_color=inSession?color.green:color.gray, text_size=size.tiny, bgcolor=color.new(color.black,80))
+
+// ─── ALERTS (paste URL in TradingView alert → Webhook URL) ───────────────────
+alertcondition(tradeBull,
+    "BUY CALL (S&D+Delta)",
+    '{"action":"BUY_CALL","confidence":' + str.tostring(bull) + ',"close":{{close}},"atr":' + str.tostring(math.round(atr14,3)) + ',"grade":"' + (isAplus ? "A+" : isA ? "A" : "B") + '","zone":"demand","symbol":"SPY","timeframe":"5"}')
+
+alertcondition(tradeBear,
+    "BUY PUT (S&D+Delta)",
+    '{"action":"BUY_PUT","confidence":' + str.tostring(bear) + ',"close":{{close}},"atr":' + str.tostring(math.round(atr14,3)) + ',"grade":"' + (isAplus ? "A+" : isA ? "A" : "B") + '","zone":"supply","symbol":"SPY","timeframe":"5"}')

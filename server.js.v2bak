@@ -1,0 +1,318 @@
+/**
+ * server.js — Trading engine
+ * Integrates strategy.js with Alpaca API, Express API, force-close scheduler
+ */
+
+const express  = require('express');
+const path     = require('path');
+const Alpaca   = require('@alpacahq/alpaca-trade-api');
+const {
+  evaluateSignal,
+  detectSDZones,
+  calcGEXLevels,
+  isValidTradingTime,
+} = require('./strategy');
+
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'client/build')));
+
+const ENV = {
+  ALPACA_KEY:       process.env.ALPACA_API_KEY      || '',
+  ALPACA_SECRET:    process.env.ALPACA_SECRET_KEY   || '',
+  PAPER:            process.env.PAPER               !== 'false',
+  PORT:             parseInt(process.env.PORT       || '3001'),
+  RISK_DOLLARS:     parseFloat(process.env.RISK_DOLLARS      || '300'),
+  ACCOUNT_SIZE:     parseFloat(process.env.ACCOUNT_SIZE      || '100000'),
+  MAX_DAILY_LOSS:   parseFloat(process.env.MAX_DAILY_LOSS    || '0.04'),
+  PREMIUM_STOP_PCT: parseFloat(process.env.PREMIUM_STOP_PCT  || '0.45'),
+  TP1_PCT:          parseFloat(process.env.TP1_PCT            || '0.50'),
+  TP2_PCT:          parseFloat(process.env.TP2_PCT            || '1.00'),
+  TP1_CLOSE_PCT:    parseFloat(process.env.TP1_CLOSE_PCT      || '0.50'),
+  ATR_STOP_MULT:    parseFloat(process.env.ATR_STOP_MULT      || '1.5'),
+  TRAIL_BREAKEVEN:  process.env.TRAIL_BREAKEVEN     !== 'false',
+  TIERED_SIZING:    process.env.TIERED_SIZING       !== 'false',
+  AUTO_TRADE:       process.env.AUTO_TRADE          === 'true',
+  MIN_CONFIDENCE:   parseInt(process.env.MIN_CONFIDENCE      || '65'),
+  FORCE_CLOSE_ET:   process.env.FORCE_CLOSE_ET               || '15:45',
+  GEX_REFRESH_MINS: parseInt(process.env.GEX_REFRESH_MINS    || '30'),
+  SCAN_INTERVAL_MINS: parseInt(process.env.SCAN_INTERVAL_MINS || '5'),
+};
+
+const state = {
+  config:        { ...ENV },
+  positions:     {},
+  trades:        [],
+  dailyPnL:      0,
+  cbTriggered:   false,
+  lastSignal:    null,
+  zones:         { demand: [], supply: [] },
+  gexData:       null,
+  gexLastFetch:  null,
+  marketOpen:    false,
+  stats: {
+    totalTrades: 0, wins: 0, losses: 0,
+    totalPnL: 0, biggestWin: 0, biggestLoss: 0,
+    winStreak: 0, lossStreak: 0, currentStreak: 0,
+    setupBreakdown: { SETUP_1: 0, SETUP_2: 0, SETUP_3: 0, SETUP_4: 0 },
+    gradeBreakdown: { 'A+': 0, A: 0, B: 0 },
+  },
+};
+
+let _alpaca = null;
+function getAlpaca() {
+  if (!_alpaca && state.config.ALPACA_KEY) {
+    _alpaca = new Alpaca({ keyId: state.config.ALPACA_KEY, secretKey: state.config.ALPACA_SECRET, paper: state.config.PAPER });
+  }
+  return _alpaca;
+}
+
+const logs = [];
+function log(msg, level = 'INFO') {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] [${level}] ${msg}`;
+  console.log(line);
+  logs.unshift({ ts, level, msg, line });
+  if (logs.length > 600) logs.pop();
+}
+
+async function getBars(symbol, timeframe, limit) {
+  const client = getAlpaca();
+  if (!client) return null;
+  try {
+    const resp = await client.getBarsV2(symbol, { timeframe, limit, feed: 'iex', adjustment: 'raw' });
+    const bars = [];
+    for await (const b of resp) bars.push({ o: b.OpenPrice, h: b.HighPrice, l: b.LowPrice, c: b.ClosePrice, v: b.Volume, t: b.Timestamp });
+    return bars;
+  } catch (e) { log(`getBars(${symbol},${timeframe}) failed: ${e.message}`, 'ERROR'); return null; }
+}
+
+function getNextFriday() {
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  while (d.getDay() !== 5) d.setDate(d.getDate() + 1);
+  return d.toISOString().split('T')[0];
+}
+
+async function refreshGEX(symbol = 'SPY') {
+  const client = getAlpaca();
+  if (!client) return;
+  try {
+    const snap  = await client.getLatestTrade(symbol);
+    const spot  = snap.Price;
+    const expiry = getNextFriday();
+    const chain  = await client.getOptionContracts({ underlying_symbols: symbol, expiration_date: expiry, limit: 200 });
+    const contracts = [];
+    if (chain?.option_contracts) {
+      for (const c of chain.option_contracts) contracts.push({ strike_price: c.strike_price, type: c.type, open_interest: c.open_interest || 0, greeks: { gamma: c.greeks?.gamma || 0 } });
+    }
+    if (contracts.length > 0) {
+      state.gexData = calcGEXLevels(contracts, spot);
+      state.gexLastFetch = new Date().toISOString();
+      log(`GEX: anchor=${state.gexData?.anchor} flip=${state.gexData?.flip} regime=${state.gexData?.regime}`);
+    } else {
+      log('GEX: empty chain — using prior levels', 'WARN');
+    }
+  } catch (e) { log(`GEX refresh failed: ${e.message}`, 'WARN'); }
+}
+
+async function findOption(symbol, direction) {
+  const client = getAlpaca();
+  if (!client) return null;
+  try {
+    const snap   = await client.getLatestTrade(symbol);
+    const spot   = snap.Price;
+    const expiry = getNextFriday();
+    const spacing = symbol === 'SPY' ? 1 : 5;
+    const strike  = Math.round(spot / spacing) * spacing;
+    const expStr  = expiry.replace(/-/g, '').slice(2);
+    const strStr  = (strike * 1000).toString().padStart(8, '0');
+    const optType = direction === 'CALL' ? 'C' : 'P';
+    return { symbol: `${symbol}${expStr}${optType}${strStr}`, strike, expiry, type: optType, spot };
+  } catch (e) { log(`findOption failed: ${e.message}`, 'ERROR'); return null; }
+}
+
+function sizeContracts(premium, grade, cfg) {
+  const maxRisk = premium * 100 * cfg.PREMIUM_STOP_PCT;
+  let base = Math.max(1, Math.floor(cfg.RISK_DOLLARS / maxRisk));
+  if (cfg.TIERED_SIZING) {
+    const mult = grade === 'A+' ? 1.5 : grade === 'A' ? 1.0 : 0.75;
+    base = Math.max(1, Math.round(base * mult));
+  }
+  return base;
+}
+
+async function placeEntry(signal) {
+  const cfg = state.config;
+  if (!cfg.AUTO_TRADE)      { log(`AUTO_TRADE OFF — signal: ${signal.direction} ${signal.confidence}% grade=${signal.grade}`); return null; }
+  if (state.cbTriggered)    { log('CB active — no entry', 'WARN'); return null; }
+  if (signal.confidence < cfg.MIN_CONFIDENCE) { log(`Conf ${signal.confidence}% < min ${cfg.MIN_CONFIDENCE}%`); return null; }
+  if (!signal.tradeable)    { log(`Not tradeable: ${signal.rejectReasons.join(', ')}`); return null; }
+  if (Object.values(state.positions).some(p => p.underlying === 'SPY')) { log('Already have SPY position'); return null; }
+
+  const client = getAlpaca();
+  if (!client) return null;
+  const opt = await findOption('SPY', signal.direction);
+  if (!opt) return null;
+
+  let premium;
+  try {
+    const q = await client.getLatestOptionQuote(opt.symbol);
+    premium = (q.AskPrice + q.BidPrice) / 2;
+    if (!premium || premium <= 0) throw new Error('zero premium');
+  } catch (e) {
+    premium = (signal.meta.atr || opt.spot * 0.003) * 0.8;
+    log(`Premium fallback: $${premium.toFixed(2)}`, 'WARN');
+  }
+
+  const contracts  = sizeContracts(premium, signal.grade, cfg);
+  const limitPrice = parseFloat((premium * 1.01).toFixed(2));
+  const premStop   = parseFloat((limitPrice * (1 - cfg.PREMIUM_STOP_PCT)).toFixed(2));
+  const atrStop    = parseFloat((limitPrice - (signal.meta.atr || limitPrice * 0.1) * cfg.ATR_STOP_MULT).toFixed(2));
+  const tp1        = parseFloat((limitPrice * (1 + cfg.TP1_PCT)).toFixed(2));
+  const tp2        = parseFloat((limitPrice * (1 + cfg.TP2_PCT)).toFixed(2));
+  const gexTP1     = signal.direction === 'CALL' ? state.gexData?.wallAbove : state.gexData?.wallBelow;
+
+  try {
+    const order = await client.createOrder({
+      symbol: opt.symbol, qty: contracts, side: 'buy', type: 'limit', time_in_force: 'day',
+      limit_price: limitPrice, client_order_id: `DSB2_ENTRY_${signal.setup?.type}_${Date.now()}`,
+    });
+    const pos = {
+      id: order.id, clientOrderId: order.client_order_id,
+      symbol: opt.symbol, underlying: 'SPY', direction: signal.direction,
+      contracts, entryPremium: limitPrice, currentPrice: limitPrice,
+      strike: opt.strike, expiry: opt.expiry, spot: opt.spot,
+      atr: signal.meta.atr, stopPrice: premStop, atrStop, tp1Price: tp1, tp2Price: tp2, gexTP1,
+      setupType: signal.setup?.type, grade: signal.grade, confidence: signal.confidence,
+      setupDesc: signal.setup?.desc, delta: signal.meta.delta,
+      zoneHit: signal.zoneHit, gexRegime: signal.meta.gexRegime,
+      tp1Hit: false, status: 'PENDING', entryTime: new Date().toISOString(),
+      unrealizedPnL: 0, pnlPct: 0,
+    };
+    state.positions[opt.symbol] = pos;
+    addTrade({ ...pos, event: 'ENTRY', price: limitPrice });
+    log(`ENTRY: ${signal.direction} ${contracts}x ${opt.symbol} @ $${limitPrice} | Grade:${signal.grade} Conf:${signal.confidence}% | Stop:$${premStop} TP1:$${tp1} TP2:$${tp2}`);
+    return pos;
+  } catch (e) { log(`createOrder failed: ${e.message}`, 'ERROR'); return null; }
+}
+
+async function closePosition(symbol, reason, partial = false, partialPct = 1.0) {
+  const client = getAlpaca();
+  const pos    = state.positions[symbol];
+  if (!pos || !client) return;
+  const qty = partial ? Math.max(1, Math.floor(pos.contracts * partialPct)) : pos.contracts;
+  try {
+    await client.createOrder({ symbol, qty, side: 'sell', type: 'market', time_in_force: 'day', client_order_id: `DSB2_EXIT_${reason}_${Date.now()}` });
+    let exitP = pos.currentPrice || pos.entryPremium;
+    try { const q = await client.getLatestOptionQuote(symbol); exitP = (q.AskPrice + q.BidPrice) / 2; } catch (_) {}
+    const pnl = (exitP - pos.entryPremium) * qty * 100;
+    state.dailyPnL += pnl;
+    updateStats(pnl, pos.setupType, pos.grade);
+    addTrade({ ...pos, event: 'EXIT', price: exitP, pnl, reason, contracts: qty });
+    log(`EXIT [${reason}]: ${qty}x ${symbol} @ ~$${exitP.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+    if (partial && qty < pos.contracts) {
+      pos.contracts -= qty; pos.tp1Hit = true;
+      if (state.config.TRAIL_BREAKEVEN) { pos.stopPrice = pos.entryPremium; log(`Stop → BE: ${symbol}`); }
+    } else { delete state.positions[symbol]; }
+    const maxLoss = state.config.ACCOUNT_SIZE * state.config.MAX_DAILY_LOSS;
+    if (state.dailyPnL < -maxLoss && !state.cbTriggered) { state.cbTriggered = true; log(`DAILY CB: $${state.dailyPnL.toFixed(2)}`, 'WARN'); }
+  } catch (e) { log(`closePosition [${reason}]: ${e.message}`, 'ERROR'); }
+}
+
+async function monitorPositions() {
+  const client = getAlpaca();
+  if (!client) return;
+  for (const [symbol, pos] of Object.entries(state.positions)) {
+    try {
+      let cur = pos.currentPrice;
+      try { const q = await client.getLatestOptionQuote(symbol); cur = (q.AskPrice + q.BidPrice) / 2; pos.currentPrice = cur; pos.unrealizedPnL = (cur - pos.entryPremium) * pos.contracts * 100; pos.pnlPct = ((cur - pos.entryPremium) / pos.entryPremium) * 100; pos.status = 'OPEN'; } catch (_) {}
+      if (cur <= pos.stopPrice)                         { await closePosition(symbol, 'PREMIUM_STOP'); continue; }
+      if (!pos.tp1Hit && cur <= pos.atrStop)            { await closePosition(symbol, 'ATR_STOP'); continue; }
+      if (!pos.tp1Hit && cur >= pos.tp1Price)           { await closePosition(symbol, 'TP1', true, state.config.TP1_CLOSE_PCT); continue; }
+      if (pos.tp1Hit  && cur >= pos.tp2Price)           { await closePosition(symbol, 'TP2'); continue; }
+    } catch (e) { log(`Monitor ${symbol}: ${e.message}`, 'ERROR'); }
+  }
+}
+
+async function runScan() {
+  if (state.cbTriggered || !isMarketHours()) return;
+  try {
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const etH = now.getHours(), etM = now.getMinutes();
+    const gexAge = state.gexLastFetch ? (Date.now() - new Date(state.gexLastFetch)) / 60000 : Infinity;
+    if (gexAge > state.config.GEX_REFRESH_MINS) await refreshGEX('SPY');
+    const [bars15m, bars5m] = await Promise.all([getBars('SPY', '15Min', 50), getBars('SPY', '5Min', 60)]);
+    if (!bars15m || !bars5m) { log('Bar fetch failed', 'WARN'); return; }
+    if (bars15m.length >= 10) {
+      state.zones = detectSDZones(bars15m.map(b=>b.o), bars15m.map(b=>b.h), bars15m.map(b=>b.l), bars15m.map(b=>b.c), bars15m.map(b=>b.v));
+    }
+    const signal = evaluateSignal({ bars15m, bars5m, gexData: state.gexData, etHour: etH, etMinute: etM });
+    state.lastSignal = signal;
+    log(`SCAN → ${signal.direction} ${signal.confidence}% grade=${signal.grade || '-'} zone=${signal.zoneHit?.type || 'none'} setup=${signal.setup?.type || 'none'}${signal.rejectReasons.length ? ' | ' + signal.rejectReasons[0] : ''}`);
+    if (signal.tradeable) await placeEntry(signal);
+    await monitorPositions();
+  } catch (e) { log(`Scan error: ${e.message}`, 'ERROR'); }
+}
+
+function scheduleForceClose() {
+  const [h, m] = state.config.FORCE_CLOSE_ET.split(':').map(Number);
+  setInterval(() => {
+    const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    if (et.getHours() === h && et.getMinutes() === m) {
+      log(`FORCE CLOSE at ${state.config.FORCE_CLOSE_ET} ET`);
+      Object.keys(state.positions).forEach(sym => closePosition(sym, 'FORCE_CLOSE_EOD'));
+    }
+  }, 60000);
+}
+
+function isMarketHours() {
+  const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const d  = et.getDay();
+  if (d === 0 || d === 6) return false;
+  const m = et.getHours() * 60 + et.getMinutes();
+  return m >= 9 * 60 + 30 && m < 16 * 60;
+}
+
+function addTrade(data) { state.trades.unshift({ ...data, id: `T${Date.now()}` }); if (state.trades.length > 300) state.trades.pop(); }
+
+function updateStats(pnl, setupType, grade) {
+  const s = state.stats;
+  s.totalTrades++; s.totalPnL += pnl;
+  if (pnl > 0) { s.wins++; s.biggestWin = Math.max(s.biggestWin, pnl); s.currentStreak = s.currentStreak >= 0 ? s.currentStreak + 1 : 1; s.winStreak = Math.max(s.winStreak, s.currentStreak); }
+  else { s.losses++; s.biggestLoss = Math.min(s.biggestLoss, pnl); s.currentStreak = s.currentStreak <= 0 ? s.currentStreak - 1 : -1; s.lossStreak = Math.min(s.lossStreak, s.currentStreak); }
+  if (setupType && s.setupBreakdown[setupType] !== undefined) s.setupBreakdown[setupType]++;
+  if (grade     && s.gradeBreakdown[grade]     !== undefined) s.gradeBreakdown[grade]++;
+}
+
+app.get('/api/state',  (req, res) => res.json({ positions: state.positions, zones: state.zones, lastSignal: state.lastSignal, gexData: state.gexData, gexLastFetch: state.gexLastFetch, dailyPnL: state.dailyPnL, cbTriggered: state.cbTriggered, marketOpen: isMarketHours(), config: state.config, stats: state.stats }));
+app.get('/api/logs',   (req, res) => res.json(logs.slice(0, 150)));
+app.get('/api/trades', (req, res) => res.json(state.trades));
+app.post('/api/close/:symbol', async (req, res) => { await closePosition(decodeURIComponent(req.params.symbol), req.body?.reason || 'MANUAL'); res.json({ ok: true }); });
+app.post('/api/scan',  async (req, res) => { await runScan(); res.json({ ok: true, signal: state.lastSignal }); });
+app.post('/api/gex-refresh', async (req, res) => { await refreshGEX('SPY'); res.json({ ok: true, gex: state.gexData }); });
+app.post('/api/config', (req, res) => {
+  const allowed = ['RISK_DOLLARS','ACCOUNT_SIZE','MAX_DAILY_LOSS','PREMIUM_STOP_PCT','TP1_PCT','TP2_PCT','TP1_CLOSE_PCT','ATR_STOP_MULT','TRAIL_BREAKEVEN','TIERED_SIZING','AUTO_TRADE','MIN_CONFIDENCE','FORCE_CLOSE_ET','GEX_REFRESH_MINS','SCAN_INTERVAL_MINS'];
+  for (const [k,v] of Object.entries(req.body)) if (allowed.includes(k)) state.config[k] = v;
+  log(`Config: ${JSON.stringify(req.body)}`); res.json({ ok: true, config: state.config });
+});
+app.post('/api/reset-daily', (req, res) => { state.dailyPnL = 0; state.cbTriggered = false; log('Daily reset'); res.json({ ok: true }); });
+app.post('/webhook', async (req, res) => {
+  const { action, confidence, close: closeP, atr: atrV, zone } = req.body;
+  log(`Webhook: ${JSON.stringify(req.body)}`);
+  if (!['BUY_CALL','BUY_PUT'].includes(action)) { res.json({ ok: false }); return; }
+  const sig = { direction: action === 'BUY_CALL' ? 'CALL' : 'PUT', confidence: confidence || 70, grade: 'A', tradeable: true, rejectReasons: [], setup: { type: 'WEBHOOK', desc: 'TradingView', grade: 'A' }, zoneHit: { hit: !!zone, type: zone||null, zone:null }, meta: { lastPrice: closeP||0, atr: atrV||0, gexRegime: state.gexData?.regime||'UNKNOWN' } };
+  state.lastSignal = sig;
+  if (state.config.AUTO_TRADE) await placeEntry(sig);
+  res.json({ ok: true });
+});
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/build/index.html')));
+
+app.listen(ENV.PORT, async () => {
+  log(`DSB v2 | port=${ENV.PORT} paper=${ENV.PAPER} autoTrade=${ENV.AUTO_TRADE}`);
+  scheduleForceClose();
+  if (isMarketHours()) await refreshGEX('SPY');
+  setInterval(runScan, ENV.SCAN_INTERVAL_MINS * 60 * 1000);
+  setTimeout(runScan, 4000);
+});
+
+module.exports = app;
