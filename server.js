@@ -572,19 +572,22 @@ function updateStats(pnl, setupType, grade) {
 }
 
 // ─── API ROUTES ────────────────────────────────────────────────────────────
-app.get('/api/state', (req, res) => res.json({
-  positions:     state.positions,
-  zones:         state.zones,
-  lastSignal:    state.lastSignal,
-  gexData:       state.gexData,
-  gexLastFetch:  state.gexLastFetch,
-  dailyPnL:      state.dailyPnL,
-  cbTriggered:   state.cbTriggered,
-  marketOpen:    isMarketHours(),
-  config:        state.config,
-  stats:         state.stats,
-  priorDayClose: state.priorDayClose,
-}));
+app.get('/api/state', (req, res) => {
+  const { ALPACA_KEY, ALPACA_SECRET, ...safeConfig } = state.config;
+  res.json({
+    positions:     state.positions,
+    zones:         state.zones,
+    lastSignal:    state.lastSignal,
+    gexData:       state.gexData,
+    gexLastFetch:  state.gexLastFetch,
+    dailyPnL:      state.dailyPnL,
+    cbTriggered:   state.cbTriggered,
+    marketOpen:    isMarketHours(),
+    config:        safeConfig,
+    stats:         state.stats,
+    priorDayClose: state.priorDayClose,
+  });
+});
 
 app.get('/api/logs',   (req, res) => res.json(logs.slice(0, 200)));
 app.get('/api/trades', (req, res) => res.json(state.trades));
