@@ -1,0 +1,699 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+
+// ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
+const C = {
+  bg:        "#050810",
+  panel:     "#090f1a",
+  panelAlt:  "#0b1220",
+  border:    "#162033",
+  borderBright: "#1e3a5f",
+  accent:    "#00c8ff",
+  accentDim: "#0066aa",
+  green:     "#00e87a",
+  greenDim:  "#00663a",
+  red:       "#ff3355",
+  redDim:    "#660022",
+  yellow:    "#f5c842",
+  orange:    "#ff8800",
+  purple:    "#a855f7",
+  muted:     "#2d4060",
+  text:      "#d4e0f0",
+  textDim:   "#5a7090",
+  textFaint: "#3a5070",
+};
+
+// ─── API HELPERS ──────────────────────────────────────────────────────────────
+const api = {
+  get:  (path)       => fetch(path).then(r => r.json()),
+  post: (path, body) => fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined }).then(r => r.json()),
+};
+
+// ─── MINI COMPONENTS ──────────────────────────────────────────────────────────
+function Pill({ color, children, small }) {
+  return (
+    <span style={{
+      display: 'inline-block', padding: small ? '1px 6px' : '2px 9px',
+      borderRadius: 3, fontSize: small ? 9 : 10, fontWeight: 700,
+      background: color + '22', border: `1px solid ${color}55`, color,
+      letterSpacing: 0.5, whiteSpace: 'nowrap',
+    }}>{children}</span>
+  );
+}
+
+function Stat({ label, value, color, sub }) {
+  return (
+    <div style={{ padding: '10px 14px', background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+      <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 1.5, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 800, color: color || C.text, lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 9, color: C.textFaint, marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Toggle({ label, checked, onChange }) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', userSelect: 'none' }}>
+      <div onClick={onChange} style={{
+        width: 36, height: 20, borderRadius: 10, position: 'relative',
+        background: checked ? C.green : C.muted, transition: 'background 0.2s', cursor: 'pointer',
+        border: `1px solid ${checked ? C.green : C.border}`,
+      }}>
+        <div style={{
+          position: 'absolute', top: 2, left: checked ? 18 : 2,
+          width: 14, height: 14, borderRadius: '50%',
+          background: checked ? '#fff' : C.textDim, transition: 'left 0.2s',
+        }} />
+      </div>
+      <span style={{ fontSize: 11, color: checked ? C.text : C.textDim }}>{label}</span>
+    </label>
+  );
+}
+
+function NumberInput({ label, value, onChange, min, max, step, prefix, suffix }) {
+  const [local, setLocal] = useState(String(value));
+  useEffect(() => setLocal(String(value)), [value]);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <label style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 1 }}>{label}</label>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        {prefix && <span style={{ fontSize: 11, color: C.textDim }}>{prefix}</span>}
+        <input
+          type="number" value={local} min={min} max={max} step={step || 1}
+          onChange={e => setLocal(e.target.value)}
+          onBlur={() => { const v = parseFloat(local); if (!isNaN(v)) onChange(v); else setLocal(String(value)); }}
+          style={{
+            width: 80, padding: '5px 8px', background: C.bg, border: `1px solid ${C.border}`,
+            color: C.text, borderRadius: 4, fontSize: 12, fontFamily: 'inherit',
+            outline: 'none',
+          }}
+        />
+        {suffix && <span style={{ fontSize: 11, color: C.textDim }}>{suffix}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ─── ZONE VISUALIZER ─────────────────────────────────────────────────────────
+function ZoneViz({ zones, lastPrice }) {
+  if (!zones) return null;
+  const allZones = [
+    ...(zones.supply || []).map(z => ({ ...z, type: 'supply' })),
+    ...(zones.demand || []).map(z => ({ ...z, type: 'demand' })),
+  ];
+  if (!allZones.length) return <div style={{ padding: 16, color: C.textDim, fontSize: 11 }}>No zones detected yet — scan running...</div>;
+
+  const allPrices = allZones.flatMap(z => [z.top, z.bottom]);
+  if (lastPrice) allPrices.push(lastPrice);
+  const min = Math.min(...allPrices) * 0.9995;
+  const max = Math.max(...allPrices) * 1.0005;
+  const range = max - min;
+
+  const toY = p => ((max - p) / range) * 200;
+
+  return (
+    <svg width="100%" height={220} style={{ overflow: 'visible' }}>
+      {allZones.map((z, i) => {
+        const y1 = toY(z.top), y2 = toY(z.bottom);
+        const c = z.type === 'supply' ? C.red : C.green;
+        return (
+          <g key={i}>
+            <rect x="5%" y={y1} width="85%" height={y2 - y1} fill={c + '18'} stroke={c + '55'} strokeWidth={1} />
+            <text x="92%" y={(y1 + y2) / 2 + 4} fill={c} fontSize={9} textAnchor="start" fontFamily="monospace">
+              {z.type === 'supply' ? '▼S' : '▲D'}
+            </text>
+            <text x="5%" y={y1 - 2} fill={c + 'aa'} fontSize={8} fontFamily="monospace">${z.top?.toFixed(2)}</text>
+          </g>
+        );
+      })}
+      {lastPrice && (
+        <line x1="5%" y1={toY(lastPrice)} x2="90%" y2={toY(lastPrice)} stroke={C.accent} strokeWidth={1.5} strokeDasharray="4 2" />
+      )}
+      {lastPrice && (
+        <text x="91%" y={toY(lastPrice) + 4} fill={C.accent} fontSize={9} fontFamily="monospace">${lastPrice.toFixed(2)}</text>
+      )}
+    </svg>
+  );
+}
+
+// ─── SIGNAL PANEL ────────────────────────────────────────────────────────────
+function SignalPanel({ signal }) {
+  if (!signal) return (
+    <div style={{ padding: 24, color: C.textDim, fontSize: 11, textAlign: 'center' }}>
+      Waiting for first scan...
+    </div>
+  );
+
+  const dirColor = signal.direction === 'CALL' ? C.green : signal.direction === 'PUT' ? C.red : C.muted;
+  const confColor = signal.confidence >= 75 ? C.green : signal.confidence >= 60 ? C.yellow : C.textDim;
+
+  return (
+    <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Direction + confidence */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ fontSize: 32, fontWeight: 900, color: dirColor }}>{signal.direction}</div>
+        <div>
+          <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 1 }}>Confidence</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: confColor }}>{signal.confidence}%</div>
+        </div>
+        <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
+          <div style={{ fontSize: 10, color: C.textDim }}>SPY Price</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text }}>${signal.lastPrice?.toFixed(2)}</div>
+        </div>
+      </div>
+
+      {/* Confidence bar */}
+      <div style={{ height: 4, background: C.border, borderRadius: 2 }}>
+        <div style={{ width: `${signal.confidence}%`, height: '100%', background: `linear-gradient(90deg, ${confColor}, ${confColor}88)`, borderRadius: 2, transition: 'width 0.5s' }} />
+      </div>
+
+      {/* Zone hit */}
+      {signal.zoneHit && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Pill color={signal.zoneHit.type === 'demand' ? C.green : C.red}>
+            {signal.zoneHit.type === 'demand' ? '▲ DEMAND ZONE' : '▼ SUPPLY ZONE'}
+          </Pill>
+          <span style={{ fontSize: 10, color: C.textDim }}>
+            ${signal.zoneHit.zone?.bottom?.toFixed(2)} – ${signal.zoneHit.zone?.top?.toFixed(2)}
+          </span>
+        </div>
+      )}
+
+      {/* Orderflow signals */}
+      {signal.orderflow?.details?.length > 0 && (
+        <div>
+          <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Orderflow Confirmation</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+            {signal.orderflow.details.map((d, i) => (
+              <Pill key={i} color={d.bias === 'bull' ? C.green : d.bias === 'bear' ? C.red : C.yellow} small>
+                {d.signal}
+              </Pill>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ATR + VWAP */}
+      <div style={{ display: 'flex', gap: 16, fontSize: 10, color: C.textDim }}>
+        {signal.atr   && <span>ATR: <span style={{ color: C.yellow }}>${signal.atr.toFixed(2)}</span></span>}
+        {signal.orderflow?.vwap && <span>VWAP: <span style={{ color: C.accent }}>${signal.orderflow.vwap.toFixed(2)}</span></span>}
+        {signal.orderflow?.rsi  && <span>RSI: <span style={{ color: signal.orderflow.rsi < 40 ? C.green : signal.orderflow.rsi > 60 ? C.red : C.text }}>{signal.orderflow.rsi.toFixed(0)}</span></span>}
+        <span style={{ marginLeft: 'auto', fontSize: 9 }}>{new Date(signal.timestamp).toLocaleTimeString()}</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── POSITIONS TABLE ─────────────────────────────────────────────────────────
+function PositionsTable({ positions, onClose }) {
+  const pos = Object.values(positions || {});
+  if (!pos.length) return (
+    <div style={{ padding: 24, color: C.textDim, fontSize: 11, textAlign: 'center' }}>No open positions</div>
+  );
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+        <thead>
+          <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+            {['Symbol','Dir','Qty','Entry','Current','P/L','Stop','TP1','TP2','ATR Stop','Status',''].map(h => (
+              <th key={h} style={{ padding: '6px 10px', color: C.textDim, textAlign: 'left', fontSize: 9, textTransform: 'uppercase', letterSpacing: 1, whiteSpace: 'nowrap' }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {pos.map(p => {
+            const pnlColor = (p.unrealizedPnL || 0) > 0 ? C.green : (p.unrealizedPnL || 0) < 0 ? C.red : C.textDim;
+            return (
+              <tr key={p.symbol} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                <td style={{ padding: '8px 10px', color: C.accent, fontWeight: 700, fontSize: 10 }}>{p.symbol?.slice(-16)}</td>
+                <td style={{ padding: '8px 10px' }}><Pill color={p.direction === 'CALL' ? C.green : C.red} small>{p.direction}</Pill></td>
+                <td style={{ padding: '8px 10px', color: C.text }}>{p.contracts}x</td>
+                <td style={{ padding: '8px 10px', color: C.text }}>${p.entryPremium?.toFixed(2)}</td>
+                <td style={{ padding: '8px 10px', color: C.text }}>{p.currentPrice ? `$${p.currentPrice.toFixed(2)}` : '—'}</td>
+                <td style={{ padding: '8px 10px', color: pnlColor, fontWeight: 700 }}>
+                  {p.unrealizedPnL !== undefined ? `${p.unrealizedPnL > 0 ? '+' : ''}$${p.unrealizedPnL.toFixed(0)}` : '—'}
+                  {p.pnlPct !== undefined && <span style={{ fontSize: 9, marginLeft: 4 }}>({p.pnlPct > 0 ? '+' : ''}{p.pnlPct?.toFixed(1)}%)</span>}
+                </td>
+                <td style={{ padding: '8px 10px', color: C.red, fontSize: 10 }}>${p.stopPrice?.toFixed(2)}</td>
+                <td style={{ padding: '8px 10px', color: C.yellow, fontSize: 10 }}>${p.tp1Price?.toFixed(2)}</td>
+                <td style={{ padding: '8px 10px', color: C.green, fontSize: 10 }}>${p.tp2Price?.toFixed(2)}</td>
+                <td style={{ padding: '8px 10px', color: C.orange, fontSize: 10 }}>${p.atrStop?.toFixed(2)}</td>
+                <td style={{ padding: '8px 10px' }}>
+                  {p.tp1Hit ? <Pill color={C.yellow} small>TP1 HIT</Pill> : <Pill color={C.accentDim} small>{p.status}</Pill>}
+                </td>
+                <td style={{ padding: '8px 10px' }}>
+                  <button onClick={() => onClose(p.symbol)} style={{
+                    padding: '3px 10px', fontSize: 10, background: C.redDim, border: `1px solid ${C.red}55`,
+                    color: C.red, borderRadius: 4, cursor: 'pointer', fontFamily: 'inherit',
+                  }}>✕ Close</button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── TRADE HISTORY ────────────────────────────────────────────────────────────
+function TradeHistory({ trades }) {
+  if (!trades?.length) return <div style={{ padding: 24, color: C.textDim, fontSize: 11, textAlign: 'center' }}>No trades yet</div>;
+  return (
+    <div style={{ overflowX: 'auto', maxHeight: 320, overflowY: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+        <thead style={{ position: 'sticky', top: 0, background: C.panel }}>
+          <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+            {['Time','Symbol','Event','Dir','Qty','Price','P/L','Reason','Conf'].map(h => (
+              <th key={h} style={{ padding: '5px 8px', color: C.textDim, textAlign: 'left', fontSize: 9, textTransform: 'uppercase', letterSpacing: 1 }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {trades.map(t => {
+            const pnlColor = (t.pnl || 0) > 0 ? C.green : (t.pnl || 0) < 0 ? C.red : C.textDim;
+            return (
+              <tr key={t.id} style={{ borderBottom: `1px solid ${C.border}18` }}>
+                <td style={{ padding: '5px 8px', color: C.textDim, whiteSpace: 'nowrap' }}>{new Date(t.entryTime).toLocaleTimeString()}</td>
+                <td style={{ padding: '5px 8px', color: C.accent, fontSize: 9 }}>{t.symbol?.slice(-12)}</td>
+                <td style={{ padding: '5px 8px' }}><Pill color={t.event === 'ENTRY' ? C.accent : C.yellow} small>{t.event}</Pill></td>
+                <td style={{ padding: '5px 8px' }}><Pill color={t.direction === 'CALL' ? C.green : C.red} small>{t.direction}</Pill></td>
+                <td style={{ padding: '5px 8px', color: C.text }}>{t.contracts}x</td>
+                <td style={{ padding: '5px 8px', color: C.text }}>${t.price?.toFixed(2)}</td>
+                <td style={{ padding: '5px 8px', color: pnlColor, fontWeight: 700 }}>
+                  {t.pnl !== undefined ? `${t.pnl > 0 ? '+' : ''}$${t.pnl.toFixed(0)}` : '—'}
+                </td>
+                <td style={{ padding: '5px 8px', color: C.textDim, fontSize: 9 }}>{t.reason || '—'}</td>
+                <td style={{ padding: '5px 8px', color: C.textDim }}>{t.confidence}%</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── PERFORMANCE MATRIX ───────────────────────────────────────────────────────
+function PerfMatrix({ stats, dailyPnL, accountSize }) {
+  const winRate = stats.totalTrades > 0 ? ((stats.wins / stats.totalTrades) * 100).toFixed(1) : '—';
+  const avgWin  = stats.wins   > 0 ? (stats.totalPnL > 0 ? stats.totalPnL / stats.wins : 0) : 0;
+  const avgLoss = stats.losses > 0 ? Math.abs(stats.biggestLoss) : 0;
+  const rr = avgLoss > 0 ? (avgWin / avgLoss).toFixed(2) : '—';
+  const dailyPct = accountSize > 0 ? ((dailyPnL / accountSize) * 100).toFixed(2) : '0';
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, padding: '12px 16px' }}>
+      <Stat label="Win Rate"     value={`${winRate}%`} color={parseFloat(winRate) >= 50 ? C.green : C.red} sub={`${stats.wins}W / ${stats.losses}L`} />
+      <Stat label="Daily P/L"    value={`${dailyPnL >= 0 ? '+' : ''}$${dailyPnL.toFixed(0)}`} color={dailyPnL >= 0 ? C.green : C.red} sub={`${dailyPct}% of account`} />
+      <Stat label="Total P/L"    value={`${stats.totalPnL >= 0 ? '+' : ''}$${stats.totalPnL.toFixed(0)}`} color={stats.totalPnL >= 0 ? C.green : C.red} sub={`${stats.totalTrades} trades`} />
+      <Stat label="Risk:Reward"  value={rr} color={parseFloat(rr) >= 1.5 ? C.green : C.yellow} sub={`Avg W: $${avgWin.toFixed(0)}`} />
+      <Stat label="Best Trade"   value={`+$${stats.biggestWin.toFixed(0)}`}  color={C.green} />
+      <Stat label="Worst Trade"  value={`$${stats.biggestLoss.toFixed(0)}`}  color={C.red} />
+      <Stat label="Win Streak"   value={stats.winStreak}  color={C.accent} sub="max" />
+      <Stat label="Loss Streak"  value={Math.abs(stats.lossStreak)} color={C.orange} sub="max" />
+    </div>
+  );
+}
+
+// ─── CONFIG PANEL ─────────────────────────────────────────────────────────────
+function ConfigPanel({ config, onUpdate }) {
+  const [local, setLocal] = useState({ ...config });
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => setLocal({ ...config }), [config]);
+
+  const save = async () => {
+    await api.post('/api/config', local);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const upd = (k, v) => setLocal(p => ({ ...p, [k]: v }));
+
+  return (
+    <div style={{ padding: '16px' }}>
+      {/* Auto-trade warning banner */}
+      {local.AUTO_TRADE && (
+        <div style={{ padding: '10px 14px', background: '#ff33551a', border: `1px solid ${C.red}55`, borderRadius: 6, marginBottom: 16, fontSize: 11, color: C.red }}>
+          ⚠️ AUTO TRADE is ON — live orders will be placed with your Alpaca paper account
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 20 }}>
+        {/* Risk */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 2, marginBottom: 2 }}>Risk Management</div>
+          <NumberInput label="Risk per Trade ($)"    value={local.RISK_DOLLARS}     min={50}   max={5000} step={50}   prefix="$" onChange={v => upd('RISK_DOLLARS', v)} />
+          <NumberInput label="Account Size ($)"      value={local.ACCOUNT_SIZE}     min={1000} max={1000000} step={1000} prefix="$" onChange={v => upd('ACCOUNT_SIZE', v)} />
+          <NumberInput label="Max Daily Loss (%)"    value={parseFloat((local.MAX_DAILY_LOSS*100).toFixed(1))} min={1} max={20} step={0.5} suffix="%" onChange={v => upd('MAX_DAILY_LOSS', v/100)} />
+          <NumberInput label="Premium Stop (%)"      value={parseFloat((local.PREMIUM_STOP_PCT*100).toFixed(0))} min={10} max={100} step={5} suffix="%" onChange={v => upd('PREMIUM_STOP_PCT', v/100)} />
+          <NumberInput label="Min Confidence (%)"    value={local.MIN_CONFIDENCE}   min={50} max={95} step={5} suffix="%" onChange={v => upd('MIN_CONFIDENCE', v)} />
+        </div>
+
+        {/* Exits */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 2, marginBottom: 2 }}>Exit Levels</div>
+          <NumberInput label="TP1 Gain (%)"          value={parseFloat((local.TP1_PCT*100).toFixed(0))} min={10} max={200} step={5} suffix="%" onChange={v => upd('TP1_PCT', v/100)} />
+          <NumberInput label="TP2 Gain (%)"          value={parseFloat((local.TP2_PCT*100).toFixed(0))} min={20} max={500} step={10} suffix="%" onChange={v => upd('TP2_PCT', v/100)} />
+          <NumberInput label="TP1 Close Size (%)"    value={parseFloat((local.TP1_CLOSE_PCT*100).toFixed(0))} min={10} max={100} step={10} suffix="%" onChange={v => upd('TP1_CLOSE_PCT', v/100)} />
+          <NumberInput label="ATR Stop Multiplier"   value={local.ATR_STOP_MULT}    min={0.5} max={5} step={0.25} onChange={v => upd('ATR_STOP_MULT', v)} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <label style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 1 }}>Force Close Time (ET)</label>
+            <input value={local.FORCE_CLOSE_ET} onChange={e => upd('FORCE_CLOSE_ET', e.target.value)}
+              style={{ width: 100, padding: '5px 8px', background: C.bg, border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, fontSize: 12, fontFamily: 'inherit' }} />
+          </div>
+        </div>
+
+        {/* Toggles */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 2, marginBottom: 2 }}>Strategy Toggles</div>
+          <Toggle label="Auto Trade (Live Orders)" checked={!!local.AUTO_TRADE} onChange={() => upd('AUTO_TRADE', !local.AUTO_TRADE)} />
+          <Toggle label="Tiered Contract Sizing"   checked={!!local.TIERED_SIZING} onChange={() => upd('TIERED_SIZING', !local.TIERED_SIZING)} />
+          <Toggle label="Trail to Breakeven @ TP1" checked={!!local.TRAIL_BREAKEVEN} onChange={() => upd('TRAIL_BREAKEVEN', !local.TRAIL_BREAKEVEN)} />
+
+          <div style={{ marginTop: 8, padding: '10px 12px', background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 10, color: C.textDim }}>
+            <div style={{ color: C.text, fontWeight: 700, marginBottom: 6 }}>Current Levels Preview</div>
+            <div>Stop: <span style={{ color: C.red }}>-{(local.PREMIUM_STOP_PCT*100).toFixed(0)}%</span></div>
+            <div>TP1: <span style={{ color: C.yellow }}>+{(local.TP1_PCT*100).toFixed(0)}% (close {(local.TP1_CLOSE_PCT*100).toFixed(0)}%)</span></div>
+            <div>TP2: <span style={{ color: C.green }}>+{(local.TP2_PCT*100).toFixed(0)}%</span></div>
+            <div>ATR Stop: <span style={{ color: C.orange }}>{local.ATR_STOP_MULT}x ATR</span></div>
+            <div>Risk/Trade: <span style={{ color: C.accent }}>${local.RISK_DOLLARS}</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 20, display: 'flex', gap: 10, alignItems: 'center' }}>
+        <button onClick={save} style={{
+          padding: '8px 24px', background: `linear-gradient(135deg, ${C.accent}, ${C.accentDim})`,
+          color: C.bg, border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700, fontFamily: 'inherit',
+        }}>
+          {saved ? '✓ Saved' : 'Save Config'}
+        </button>
+        <span style={{ fontSize: 10, color: C.textDim }}>Changes take effect immediately — no restart needed</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── LOGS PANEL ───────────────────────────────────────────────────────────────
+function LogsPanel({ logs }) {
+  const ref = useRef(null);
+  return (
+    <div ref={ref} style={{ padding: '12px 16px', height: 280, overflowY: 'auto', fontFamily: 'monospace', fontSize: 10 }}>
+      {!logs?.length ? <div style={{ color: C.textDim }}>No logs yet...</div> : logs.map((l, i) => {
+        const isError = l.includes('error') || l.includes('Error') || l.includes('failed');
+        const isWarn  = l.includes('WARN') || l.includes('circuit');
+        const isGood  = l.includes('PLACED') || l.includes('TP') || l.includes('CLOSED');
+        const color = isError ? C.red : isWarn ? C.yellow : isGood ? C.green : C.textDim;
+        return <div key={i} style={{ color, marginBottom: 3, lineHeight: 1.4 }}>{l}</div>;
+      })}
+    </div>
+  );
+}
+
+// ─── STRATEGY EXPLAINER ───────────────────────────────────────────────────────
+function StrategyExplainer() {
+  return (
+    <div style={{ padding: '16px 20px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, fontSize: 11 }}>
+      <div>
+        <div style={{ fontSize: 10, color: C.accent, textTransform: 'uppercase', letterSpacing: 2, marginBottom: 10 }}>Entry Rules</div>
+        {[
+          ['1. Zone Map', '15m S&D zones detected from strong base + impulse candles'],
+          ['2. Price at Zone', 'SPY must be within demand (for calls) or supply (for puts)'],
+          ['3. Orderflow Confirm', 'CVD divergence + volume absorption must agree with zone'],
+          ['4. EMA Stack', '9 EMA above/below 21 EMA in the trade direction'],
+          ['5. VWAP Position', 'Price above VWAP for calls, below for puts'],
+          ['6. Min Confidence', `Combined score must exceed ${65}%`],
+        ].map(([k, v]) => (
+          <div key={k} style={{ marginBottom: 8 }}>
+            <span style={{ color: C.yellow, fontWeight: 700 }}>{k}: </span>
+            <span style={{ color: C.textDim }}>{v}</span>
+          </div>
+        ))}
+      </div>
+      <div>
+        <div style={{ fontSize: 10, color: C.accent, textTransform: 'uppercase', letterSpacing: 2, marginBottom: 10 }}>Exit Rules</div>
+        {[
+          ['Stop Loss', 'Fixed % of option premium (default: 50%)'],
+          ['ATR Stop', 'ATR × multiplier — tighter on high-volatility days'],
+          ['TP1', '50% gain → close 50% of position, trail stop to breakeven'],
+          ['TP2', '100% gain → close remaining position'],
+          ['Force Close', 'All positions closed at 3:45 PM ET regardless'],
+          ['Daily CB', 'No new trades if daily loss exceeds max %'],
+        ].map(([k, v]) => (
+          <div key={k} style={{ marginBottom: 8 }}>
+            <span style={{ color: C.orange, fontWeight: 700 }}>{k}: </span>
+            <span style={{ color: C.textDim }}>{v}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── SECTION WRAPPER ─────────────────────────────────────────────────────────
+function Section({ title, badge, children, collapsible = false }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden', marginBottom: 12 }}>
+      <div
+        onClick={() => collapsible && setOpen(p => !p)}
+        style={{ padding: '10px 16px', borderBottom: open ? `1px solid ${C.border}` : 'none', display: 'flex', alignItems: 'center', gap: 10, cursor: collapsible ? 'pointer' : 'default', background: C.panelAlt }}
+      >
+        <span style={{ fontSize: 11, fontWeight: 700, color: C.text, textTransform: 'uppercase', letterSpacing: 1.5 }}>{title}</span>
+        {badge && <span style={{ marginLeft: 4 }}>{badge}</span>}
+        {collapsible && <span style={{ marginLeft: 'auto', color: C.textDim, fontSize: 12 }}>{open ? '▾' : '▸'}</span>}
+      </div>
+      {open && children}
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [data, setData]   = useState(null);
+  const [logs, setLogs]   = useState([]);
+  const [trades, setTrades] = useState([]);
+  const [tab, setTab]     = useState('dashboard');
+  const [scanning, setScanning] = useState(false);
+  const [err, setErr]     = useState(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [s, l, t] = await Promise.all([api.get('/api/state'), api.get('/api/logs'), api.get('/api/trades')]);
+      setData(s);
+      setLogs(l);
+      setTrades(t);
+      setErr(null);
+    } catch (e) {
+      setErr('Cannot reach server — is Railway deployed?');
+    }
+  }, []);
+
+  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [refresh]);
+
+  const handleClose = async (sym) => {
+    if (!window.confirm(`Close position ${sym}?`)) return;
+    await api.post(`/api/close/${encodeURIComponent(sym)}`, { reason: 'manual' });
+    refresh();
+  };
+
+  const handleScan = async () => {
+    setScanning(true);
+    await api.post('/api/scan');
+    await refresh();
+    setScanning(false);
+  };
+
+  const handleConfig = async (cfg) => {
+    await api.post('/api/config', cfg);
+    refresh();
+  };
+
+  const handleResetDaily = async () => {
+    if (!window.confirm('Reset daily P/L and circuit breaker?')) return;
+    await api.post('/api/reset-daily');
+    refresh();
+  };
+
+  const posCount   = data ? Object.keys(data.positions || {}).length : 0;
+  const isAutoOn   = data?.autoTrade;
+  const mktOpen    = data?.marketOpen;
+  const cbActive   = data?.cbTriggered;
+
+  return (
+    <div style={{ minHeight: '100vh', background: C.bg, color: C.text, fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
+
+      {/* ── HEADER ── */}
+      <div style={{ background: C.panel, borderBottom: `1px solid ${C.border}`, padding: '12px 20px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontSize: 16, fontWeight: 900, color: C.accent, letterSpacing: -0.5 }}>
+            ◈ DEMAND/SUPPLY BOT
+          </div>
+          <div style={{ fontSize: 9, color: C.textDim, letterSpacing: 2, marginTop: 1 }}>
+            S&D ZONES · ORDERFLOW · CVD · ATR EXITS · TIERED SIZING
+          </div>
+        </div>
+
+        {/* Status pills */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginLeft: 8 }}>
+          <Pill color={mktOpen ? C.green : C.muted}>{mktOpen ? '● MARKET OPEN' : '● CLOSED'}</Pill>
+          <Pill color={isAutoOn ? C.green : C.yellow}>{isAutoOn ? '⚡ AUTO ON' : '◎ MANUAL'}</Pill>
+          {cbActive && <Pill color={C.red}>⛔ LOSS CB ACTIVE</Pill>}
+          {data?.config?.PAPER !== false && <Pill color={C.purple}>PAPER MODE</Pill>}
+          {posCount > 0 && <Pill color={C.accent}>{posCount} OPEN</Pill>}
+        </div>
+
+        {/* Daily P/L */}
+        {data && (
+          <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
+            <div style={{ fontSize: 9, color: C.textDim, textTransform: 'uppercase', letterSpacing: 1 }}>Daily P/L</div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: data.dailyPnL >= 0 ? C.green : C.red }}>
+              {data.dailyPnL >= 0 ? '+' : ''}${data.dailyPnL.toFixed(2)}
+            </div>
+          </div>
+        )}
+
+        {/* Controls */}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={handleScan} disabled={scanning || !data}
+            style={{ padding: '7px 16px', background: scanning ? C.muted : `linear-gradient(135deg, ${C.accent}, ${C.accentDim})`, color: C.bg, border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 11, fontWeight: 700, fontFamily: 'inherit' }}>
+            {scanning ? '⏳ Scanning...' : '▶ Scan Now'}
+          </button>
+          {cbActive && (
+            <button onClick={handleResetDaily} style={{ padding: '7px 14px', background: C.redDim, border: `1px solid ${C.red}55`, color: C.red, borderRadius: 6, cursor: 'pointer', fontSize: 11, fontFamily: 'inherit' }}>
+              Reset Daily CB
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Error banner */}
+      {err && <div style={{ padding: '10px 20px', background: C.redDim, color: C.red, fontSize: 11 }}>⚠ {err}</div>}
+
+      {/* ── TABS ── */}
+      <div style={{ display: 'flex', gap: 0, background: C.panel, borderBottom: `1px solid ${C.border}` }}>
+        {[['dashboard','Dashboard'],['config','Config'],['strategy','Strategy']].map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)} style={{
+            padding: '10px 20px', fontSize: 11, background: 'transparent',
+            color: tab === id ? C.accent : C.textDim,
+            borderBottom: tab === id ? `2px solid ${C.accent}` : '2px solid transparent',
+            border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontWeight: tab === id ? 700 : 400,
+          }}>{label}</button>
+        ))}
+      </div>
+
+      <div style={{ padding: '16px 20px', maxWidth: 1400 }}>
+
+        {/* ── DASHBOARD TAB ── */}
+        {tab === 'dashboard' && (
+          <>
+            {/* Top row: Signal + Zone Viz */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Section title="Latest Signal" badge={data?.lastSignal && <Pill color={data.lastSignal.direction === 'CALL' ? C.green : data.lastSignal.direction === 'PUT' ? C.red : C.muted}>{data.lastSignal.direction}</Pill>}>
+                <SignalPanel signal={data?.lastSignal} />
+              </Section>
+              <Section title="S&D Zone Map (15m)">
+                <div style={{ padding: '8px 16px' }}>
+                  <ZoneViz zones={data?.zones} lastPrice={data?.lastSignal?.lastPrice} />
+                  <div style={{ display: 'flex', gap: 16, marginTop: 8, fontSize: 10 }}>
+                    <span><span style={{ color: C.green }}>▲</span> Demand zones: {data?.zones?.demand?.length || 0}</span>
+                    <span><span style={{ color: C.red }}>▼</span> Supply zones: {data?.zones?.supply?.length || 0}</span>
+                  </div>
+                </div>
+              </Section>
+            </div>
+
+            {/* Performance */}
+            <Section title="Performance Matrix" collapsible>
+              {data && <PerfMatrix stats={data.stats} dailyPnL={data.dailyPnL} accountSize={data.config?.ACCOUNT_SIZE || 100000} />}
+            </Section>
+
+            {/* Open Positions */}
+            <Section title="Open Positions" badge={posCount > 0 && <Pill color={C.accent}>{posCount}</Pill>}>
+              <PositionsTable positions={data?.positions} onClose={handleClose} />
+            </Section>
+
+            {/* Trade History */}
+            <Section title="Trade History" badge={trades.length > 0 && <Pill color={C.textDim}>{trades.length}</Pill>} collapsible>
+              <TradeHistory trades={trades} />
+            </Section>
+
+            {/* Logs */}
+            <Section title="System Logs" collapsible>
+              <LogsPanel logs={logs} />
+            </Section>
+          </>
+        )}
+
+        {/* ── CONFIG TAB ── */}
+        {tab === 'config' && (
+          <Section title="Live Configuration — changes apply immediately">
+            {data?.config && <ConfigPanel config={data.config} onUpdate={handleConfig} />}
+          </Section>
+        )}
+
+        {/* ── STRATEGY TAB ── */}
+        {tab === 'strategy' && (
+          <>
+            <Section title="Strategy Overview: S&D Zones + Orderflow Confluence">
+              <StrategyExplainer />
+            </Section>
+            <Section title="TradingView Pine Script Webhook Setup" collapsible>
+              <div style={{ padding: '16px 20px', fontSize: 11, color: C.textDim, lineHeight: 1.8 }}>
+                <p style={{ color: C.text, marginBottom: 12 }}>This bot runs autonomously, but you can also fire trades from TradingView alerts via webhook:</p>
+                {[
+                  ['Webhook URL', `https://your-app.up.railway.app/webhook`],
+                  ['Method', 'POST'],
+                  ['Content-Type', 'application/json'],
+                  ['Body for Call', '{"action":"BUY_CALL","confidence":75,"close":{{close}},"atr":{{atr(14)}}}'],
+                  ['Body for Put',  '{"action":"BUY_PUT","confidence":75,"close":{{close}},"atr":{{atr(14)}}}'],
+                ].map(([k, v]) => (
+                  <div key={k} style={{ marginBottom: 8 }}>
+                    <span style={{ color: C.yellow, minWidth: 140, display: 'inline-block' }}>{k}: </span>
+                    <code style={{ background: C.panelAlt, padding: '2px 8px', borderRadius: 3, color: C.accent, fontSize: 10 }}>{v}</code>
+                  </div>
+                ))}
+                <p style={{ marginTop: 16, color: C.textDim }}>
+                  Pine Script indicators to add on SPY 5m chart: Supply/Demand zones, EMA 9/21/50, VWAP, Volume Delta
+                </p>
+              </div>
+            </Section>
+            <Section title="Railway Environment Variables" collapsible>
+              <div style={{ padding: '16px 20px' }}>
+                <div style={{ fontFamily: 'monospace', fontSize: 10, lineHeight: 2, background: C.bg, padding: 16, borderRadius: 6, border: `1px solid ${C.border}` }}>
+                  {[
+                    'ALPACA_API_KEY=your_paper_key',
+                    'ALPACA_SECRET_KEY=your_paper_secret',
+                    'PAPER=true',
+                    'AUTO_TRADE=false',
+                    'RISK_DOLLARS=300',
+                    'ACCOUNT_SIZE=100000',
+                    'MAX_DAILY_LOSS=0.04',
+                    'PREMIUM_STOP_PCT=0.50',
+                    'TP1_PCT=0.50',
+                    'TP2_PCT=1.00',
+                    'TP1_CLOSE_PCT=0.50',
+                    'ATR_STOP_MULT=1.5',
+                    'MIN_CONFIDENCE=65',
+                    'TIERED_SIZING=true',
+                    'TRAIL_BREAKEVEN=true',
+                    'FORCE_CLOSE_ET=15:45',
+                    'PORT=3001',
+                  ].map(line => (
+                    <div key={line}><span style={{ color: C.yellow }}>{line.split('=')[0]}</span><span style={{ color: C.textDim }}>=</span><span style={{ color: C.green }}>{line.split('=')[1]}</span></div>
+                  ))}
+                </div>
+              </div>
+            </Section>
+          </>
+        )}
+      </div>
+
+      {/* Footer */}
+      <div style={{ padding: '10px 20px', borderTop: `1px solid ${C.border}`, background: C.panel, fontSize: 9, color: C.textFaint, textAlign: 'center' }}>
+        ⚠ PAPER TRADING ONLY — Educational purposes · Options involve significant risk · Always validate before live trading · Auto-refreshes every 8s
+      </div>
+    </div>
+  );
+}
