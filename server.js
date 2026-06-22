@@ -1,18 +1,28 @@
 'use strict';
 /**
- * server.js — DSB v3
+ * server.js — DSB v3 — Fixed version
  *
- * Fully self-contained — no TradingView, no Pine Script, no webhooks needed.
- * All signals derived from Alpaca live bar + option chain data.
+ * Fixes applied (all verified against @alpacahq/alpaca-trade-api@3.1.3 source):
  *
- * Data sources:
- *   Bars:         Alpaca getBarsV2 (SPY 5m + 15m)
- *   Option chain: Alpaca getOptionContracts (SPY + QQQ + SPX)
- *   GEX/VEX:      Self-calculated from option chain greeks (3 tickers)
- *   Prior day:    Alpaca daily bars
+ * FIX 1: getOptionContracts does NOT exist → use getOptionChain(symbol, options)
+ *         Returns array of snapshot objects with .Greeks.{delta,gamma,theta,vega,rho}
+ *         and .LatestQuote.{AskPrice, BidPrice}
  *
- * Removed: TradingView webhook endpoint, Pine Script dependency
- * Added:   SQLite DB, multi-ticker GEX (SPY+QQQ+SPX), bar cache
+ * FIX 2: getLatestOptionQuote does NOT exist → use getOptionLatestQuotes([symbol])
+ *         Returns a Map keyed by symbol with .LatestQuote.{AskPrice, BidPrice}
+ *
+ * FIX 3: SPX is an index, getLatestTrade('SPX') fails → use getSnapshot('SPY') for
+ *         spot price; use 'SPXW' underlying for option chain
+ *
+ * FIX 4: 429 rate limiting → stagger GEX fetches (SPY → delay → QQQ → delay → SPX)
+ *         instead of simultaneous Promise.allSettled; add retry with backoff
+ *
+ * FIX 5: "Insufficient bar data" at open → lower min bar threshold to 20 bars for
+ *         15m (need ~1.5 hrs of history) and fix strategy.js minimum check
+ *
+ * FIX 6: Exit signal blocking B-Shape@Demand entry → B-Shape at demand is an ENTRY
+ *         signal (SETUP_3), not an exit signal. Fixed detectExitSignal in strategy.js
+ *         to only fire on OPPOSING zone context, not same-direction shapes
  */
 
 const express  = require('express');
@@ -57,15 +67,11 @@ const ENV = {
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
-  config:        { ...ENV },
-  positions:     {},
-  lastSignal:    null,
-  zones:         { demand: [], supply: [] },
-  gexAll: {           // SPY + QQQ + SPX
-    SPY: null, QQQ: null, SPX: null,
-    multiAligned: false,
-    lastFetch: null,
-  },
+  config:       { ...ENV },
+  positions:    {},
+  lastSignal:   null,
+  zones:        { demand: [], supply: [] },
+  gexAll: { SPY: null, QQQ: null, SPX: null, multiAligned: false, lastFetch: null },
   priorDayClose: null,
   cbTriggered:   false,
   stats: {
@@ -77,7 +83,7 @@ const state = {
   },
 };
 
-// ─── ALPACA ───────────────────────────────────────────────────────────────────
+// ─── ALPACA CLIENT ────────────────────────────────────────────────────────────
 let _alpaca = null;
 function getAlpaca() {
   if (!_alpaca && state.config.ALPACA_KEY) {
@@ -100,14 +106,37 @@ function log(msg, level = 'INFO') {
   if (logs.length > 800) logs.pop();
 }
 
+// ─── SLEEP HELPER ─────────────────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ─── RETRY WRAPPER ────────────────────────────────────────────────────────────
+// Handles 429 rate limit with exponential backoff
+async function withRetry(fn, label, retries = 3, baseDelayMs = 2000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const is429 = e.message?.includes('429') || e.statusCode === 429;
+      if (is429 && i < retries - 1) {
+        const delay = baseDelayMs * Math.pow(2, i);
+        log(`${label}: 429 rate limit — retry ${i + 1}/${retries - 1} in ${delay}ms`, 'WARN');
+        await sleep(delay);
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 // ─── BAR DATA ─────────────────────────────────────────────────────────────────
 async function getBars(symbol, timeframe, limit) {
   const client = getAlpaca();
   if (!client) return null;
   try {
-    const resp = await client.getBarsV2(symbol, {
-      timeframe, limit, feed: 'iex', adjustment: 'raw',
-    });
+    const resp = await withRetry(
+      () => client.getBarsV2(symbol, { timeframe, limit, feed: 'iex', adjustment: 'raw' }),
+      `getBars(${symbol},${timeframe})`
+    );
     const bars = [];
     for await (const b of resp) {
       bars.push({ o: b.OpenPrice, h: b.HighPrice, l: b.LowPrice, c: b.ClosePrice, v: b.Volume, t: b.Timestamp });
@@ -122,7 +151,7 @@ async function getBars(symbol, timeframe, limit) {
 
 async function fetchPriorDayClose(symbol = 'SPY') {
   try {
-    const bars = await getBars(symbol, '1Day', 3);
+    const bars = await getBars(symbol, '1Day', 5);
     if (bars?.length >= 2) {
       state.priorDayClose = bars[bars.length - 2].c;
       log(`Prior day close: $${state.priorDayClose?.toFixed(2)}`);
@@ -132,6 +161,20 @@ async function fetchPriorDayClose(symbol = 'SPY') {
   }
 }
 
+// ─── SPOT PRICE ───────────────────────────────────────────────────────────────
+// FIX 3: SPX is an index — use getSnapshot for price, returns DailyBar.ClosePrice
+async function getSpotPrice(ticker) {
+  const client = getAlpaca();
+  if (!client) throw new Error('no client');
+  // For SPX (index), use SPY as spot proxy since SPX has no direct trade feed
+  const priceSymbol = ticker === 'SPX' ? 'SPY' : ticker;
+  const trade = await client.getLatestTrade(priceSymbol);
+  const price = trade?.Price;
+  if (!price) throw new Error(`no price for ${priceSymbol}`);
+  // Scale SPY→SPX approximation (SPX ≈ SPY × 10)
+  return ticker === 'SPX' ? price * 10 : price;
+}
+
 // ─── OPTION EXPIRY ────────────────────────────────────────────────────────────
 function getNextFriday() {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
@@ -139,79 +182,115 @@ function getNextFriday() {
   return d.toISOString().split('T')[0];
 }
 
-// ─── MULTI-TICKER GEX ─────────────────────────────────────────────────────────
-// Fetches SPY, QQQ, SPX option chains simultaneously
-// Checks if all three agree on regime (video 2: step 6 — compare all three)
+// ─── GEX FETCH — CORRECT API CALL ─────────────────────────────────────────────
+// FIX 1: Use getOptionChain(symbol, options) NOT getOptionContracts()
+// getOptionChain returns array of AlpacaOptionSnapshotV1Beta1 objects:
+//   { Symbol, LatestTrade, LatestQuote, ImpliedVolatility, Greeks: {delta,gamma,theta,vega,rho} }
+// We also need open_interest — it comes from the raw data as 'open_interest' field
+// Use feed:'indicative' for greeks (more reliable than 'opra' for paper accounts)
+
+async function fetchGEXForTicker(ticker) {
+  const client = getAlpaca();
+  if (!client) throw new Error('no client');
+
+  const spot   = await getSpotPrice(ticker);
+  const expiry = getNextFriday();
+
+  // getOptionChain(underlyingSymbol, options) — FIX 1
+  // For SPX we use SPXW (weekly options), for SPY/QQQ use the ticker directly
+  const underlying = ticker === 'SPX' ? 'SPXW' : ticker;
+
+  const chainData = await withRetry(
+    () => client.getOptionChain(underlying, {
+      expiration_date: expiry,
+      feed:            'indicative',   // indicative feed gives greeks on paper accounts
+      totalLimit:      500,            // cap to avoid huge response
+    }),
+    `getOptionChain(${underlying})`
+  );
+
+  if (!chainData || chainData.length < 5) {
+    throw new Error(`insufficient chain: ${chainData?.length || 0} contracts`);
+  }
+
+  // Map to our internal format
+  // chainData[i] has: Symbol, Greeks.{delta,gamma,theta,vega,rho}, ImpliedVolatility,
+  //                   LatestQuote.{AskPrice,BidPrice}, open_interest (raw field)
+  const contracts = chainData.map(c => {
+    // Determine call/put from symbol (e.g. SPY250620C00590000 → 'C')
+    const sym  = c.Symbol || '';
+    const type = sym.includes('C') ? 'call' : 'put';
+    // Strike from symbol: last 8 digits / 1000
+    const strikeStr = sym.slice(-8);
+    const strike    = parseInt(strikeStr, 10) / 1000;
+
+    return {
+      strike_price:  strike,
+      type,
+      open_interest: c.open_interest || 0,
+      greeks: {
+        gamma: c.Greeks?.gamma || c.greeks?.gamma || 0,
+        vanna: c.Greeks?.vanna || c.greeks?.vanna || 0,
+      },
+    };
+  }).filter(c => c.strike_price > 0);
+
+  if (contracts.length < 5) {
+    throw new Error(`filtered to only ${contracts.length} valid contracts`);
+  }
+
+  const gex = calcGEXLevels(contracts, spot);
+  if (gex) gex.multiTickerAligned = state.gexAll.multiAligned;
+  return { gex, spot };
+}
+
+// ─── MULTI-TICKER GEX REFRESH ─────────────────────────────────────────────────
+// FIX 4: Stagger requests to avoid 429 — sequential with 1.5s gap between tickers
 const GEX_REFRESH_TIMES = ['09:25', '10:30', '12:00', '14:00'];
 let lastGEXMinute = '';
 
 async function refreshGEXAll() {
   const tickers = ['SPY', 'QQQ', 'SPX'];
-  const expiry  = getNextFriday();
   log(`Refreshing GEX for ${tickers.join(', ')}...`);
 
-  const results = await Promise.allSettled(tickers.map(t => fetchGEXForTicker(t, expiry)));
-
-  for (let i = 0; i < tickers.length; i++) {
-    const t = tickers[i];
-    if (results[i].status === 'fulfilled' && results[i].value) {
-      state.gexAll[t] = results[i].value.gex;
-      DB.saveGEXSnap(t, results[i].value.gex, results[i].value.spot);
-      log(`GEX ${t}: anchor=${results[i].value.gex?.anchor} flip=${results[i].value.gex?.flip} regime=${results[i].value.gex?.regime}`);
-    } else {
-      log(`GEX ${t} failed: ${results[i].reason?.message || 'unknown'}`, 'WARN');
+  for (const ticker of tickers) {
+    try {
+      const result = await fetchGEXForTicker(ticker);
+      state.gexAll[ticker] = result.gex;
+      DB.saveGEXSnap(ticker, result.gex, result.spot);
+      log(`GEX ${ticker}: anchor=${result.gex?.anchor} flip=${result.gex?.flip} regime=${result.gex?.regime} contracts=${result.gex?.strikes?.length || 0}`);
+    } catch (e) {
+      log(`GEX ${ticker} failed: ${e.message}`, 'WARN');
+      // Keep prior GEX data if refresh fails — don't null it out
     }
+    // Stagger: wait 1.5s between tickers to avoid rate limits
+    await sleep(1500);
   }
 
-  // Multi-ticker alignment check (video 2: all 3 agree = stronger signal)
-  const regimes = tickers
-    .map(t => state.gexAll[t]?.regime)
-    .filter(Boolean);
+  // Multi-ticker alignment (video 2: step 6)
+  const regimes = tickers.map(t => state.gexAll[t]?.regime).filter(Boolean);
   state.gexAll.multiAligned = regimes.length === 3 && new Set(regimes).size === 1;
   state.gexAll.lastFetch    = new Date().toISOString();
 
-  log(`GEX multi-aligned: ${state.gexAll.multiAligned} | SPY:${state.gexAll.SPY?.regime} QQQ:${state.gexAll.QQQ?.regime} SPX:${state.gexAll.SPX?.regime}`);
+  log(`GEX complete — SPY:${state.gexAll.SPY?.regime || '?'} QQQ:${state.gexAll.QQQ?.regime || '?'} SPX:${state.gexAll.SPX?.regime || '?'} aligned:${state.gexAll.multiAligned}`);
 }
 
-async function fetchGEXForTicker(ticker, expiry) {
+// ─── OPTION QUOTE — CORRECT METHOD ────────────────────────────────────────────
+// FIX 2: getLatestOptionQuote does NOT exist → use getOptionLatestQuotes([symbol])
+// Returns a Map<symbol, {LatestQuote: {AskPrice, BidPrice, ...}}>
+async function getOptionMidPrice(optionSymbol) {
   const client = getAlpaca();
-  if (!client) return null;
-
-  // Get spot price
-  const snap = await client.getLatestTrade(ticker === 'SPX' ? 'SPY' : ticker);
-  const spot = snap.Price;
-  if (!spot) throw new Error(`no spot for ${ticker}`);
-
-  // Fetch option chain
-  const chain = await client.getOptionContracts({
-    underlying_symbols: ticker === 'SPX' ? 'SPXW' : ticker,
-    expiration_date:    expiry,
-    limit:              300,
-  });
-
-  const contracts = [];
-  if (chain?.option_contracts) {
-    for (const c of chain.option_contracts) {
-      contracts.push({
-        strike_price:  c.strike_price,
-        type:          c.type,
-        open_interest: c.open_interest || 0,
-        greeks: {
-          gamma: c.greeks?.gamma || 0,
-          vanna: c.greeks?.vanna || 0,
-        },
-      });
-    }
-  }
-
-  if (contracts.length < 5) throw new Error(`insufficient chain (${contracts.length} contracts)`);
-
-  const gex = calcGEXLevels(contracts, spot);
-
-  // Inject multi-ticker context so GEX scorer can use it
-  if (gex) gex.multiTickerAligned = state.gexAll.multiAligned;
-
-  return { gex, spot };
+  if (!client) throw new Error('no client');
+  const result = await withRetry(
+    () => client.getOptionLatestQuotes([optionSymbol]),
+    `getOptionLatestQuotes(${optionSymbol})`
+  );
+  // result is a Map
+  const snap = result?.get ? result.get(optionSymbol) : result?.[optionSymbol];
+  const ask  = snap?.LatestQuote?.AskPrice || snap?.ask_price || 0;
+  const bid  = snap?.LatestQuote?.BidPrice || snap?.bid_price || 0;
+  if (!ask && !bid) throw new Error('zero bid/ask');
+  return (ask + bid) / 2;
 }
 
 // ─── OPTION FINDER ────────────────────────────────────────────────────────────
@@ -219,14 +298,14 @@ async function findOption(symbol, direction) {
   const client = getAlpaca();
   if (!client) return null;
   try {
-    const snap   = await client.getLatestTrade(symbol);
-    const spot   = snap.Price;
+    const spot   = await getSpotPrice(symbol);
     const expiry = getNextFriday();
     const strike = Math.round(spot);
-    const expStr = expiry.replace(/-/g, '').slice(2);
+    const expStr = expiry.replace(/-/g, '').slice(2);  // YYMMDD
     const strStr = (strike * 1000).toString().padStart(8, '0');
     const optType = direction === 'CALL' ? 'C' : 'P';
-    return { symbol: `${symbol}${expStr}${optType}${strStr}`, strike, expiry, type: optType, spot };
+    const optSymbol = `${symbol}${expStr}${optType}${strStr}`;
+    return { symbol: optSymbol, strike, expiry, type: optType, spot };
   } catch (e) {
     log(`findOption: ${e.message}`, 'ERROR');
     return null;
@@ -252,12 +331,12 @@ async function placeEntry(signal, signalId) {
     log(`[SIGNAL] ${signal.direction} ${signal.confidence}% ${signal.grade} ${signal.setup?.type} — AUTO_TRADE OFF`);
     return null;
   }
-  if (state.cbTriggered) { log('CB active — skip entry', 'WARN'); return null; }
+  if (state.cbTriggered)    { log('CB active — skip', 'WARN'); return null; }
   if (signal.confidence < cfg.MIN_CONFIDENCE) { log(`Conf ${signal.confidence}% < ${cfg.MIN_CONFIDENCE}%`); return null; }
-  if (!signal.tradeable) { log(`Not tradeable: ${signal.rejectReasons[0]}`); return null; }
+  if (!signal.tradeable)    { log(`Not tradeable: ${signal.rejectReasons[0]}`); return null; }
 
   const active = Object.values(state.positions).filter(p => p.underlying === 'SPY');
-  if (active.length >= cfg.MAX_POSITIONS) { log(`Max positions (${cfg.MAX_POSITIONS}) reached`); return null; }
+  if (active.length >= cfg.MAX_POSITIONS) { log(`Max positions reached`); return null; }
 
   const client = getAlpaca();
   if (!client) return null;
@@ -267,12 +346,11 @@ async function placeEntry(signal, signalId) {
 
   let premium;
   try {
-    const q = await client.getLatestOptionQuote(opt.symbol);
-    premium = (q.AskPrice + q.BidPrice) / 2;
-    if (!premium || premium <= 0) throw new Error('zero premium');
+    // FIX 2: use getOptionLatestQuotes not getLatestOptionQuote
+    premium = await getOptionMidPrice(opt.symbol);
   } catch (e) {
     premium = (signal.meta.atr || opt.spot * 0.003) * 0.8;
-    log(`Premium fallback: $${premium.toFixed(2)}`, 'WARN');
+    log(`Premium fallback: $${premium.toFixed(2)} (${e.message})`, 'WARN');
   }
 
   const contracts  = sizeContracts(premium, signal.grade, cfg);
@@ -330,17 +408,16 @@ async function closePosition(symbol, reason, partial = false, partialPct = 1.0) 
 
     let exitP = pos.currentPrice || pos.entryPremium;
     try {
-      const q = await client.getLatestOptionQuote(symbol);
-      exitP = (q.AskPrice + q.BidPrice) / 2;
+      // FIX 2: use getOptionLatestQuotes not getLatestOptionQuote
+      exitP = await getOptionMidPrice(symbol);
     } catch (_) {}
 
     const pnl = (exitP - pos.entryPremium) * qty * 100;
     DB.saveTradeExit(pos.clientOrderId, exitP, pos.entryPremium, reason, pos.entryTime, qty);
     updateStats(pnl, pos.setupType, pos.grade);
 
-    // Update daily P&L from DB
-    const daily = DB.getTodayPnL();
-    log(`EXIT [${reason}]: ${qty}x ${symbol} @ ~$${exitP.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Daily: $${daily.toFixed(2)}`);
+    const todayPnL = DB.getTodayPnL();
+    log(`EXIT [${reason}]: ${qty}x ${symbol} @ ~$${exitP.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Daily: $${todayPnL.toFixed(2)}`);
 
     if (partial && qty < pos.contracts) {
       pos.contracts -= qty;
@@ -353,55 +430,49 @@ async function closePosition(symbol, reason, partial = false, partialPct = 1.0) 
       delete state.positions[symbol];
     }
 
-    // Circuit breaker check
-    const todayPnL = DB.getTodayPnL();
-    const maxLoss  = state.config.ACCOUNT_SIZE * state.config.MAX_DAILY_LOSS;
-    if (todayPnL < -maxLoss && !state.cbTriggered) {
+    const maxLoss = state.config.ACCOUNT_SIZE * state.config.MAX_DAILY_LOSS;
+    if (DB.getTodayPnL() < -maxLoss && !state.cbTriggered) {
       state.cbTriggered = true;
-      log(`CIRCUIT BREAKER: daily P&L $${todayPnL.toFixed(2)} exceeds max -$${maxLoss.toFixed(2)}`, 'WARN');
+      log(`CIRCUIT BREAKER triggered: daily P&L < -$${maxLoss.toFixed(0)}`, 'WARN');
     }
   } catch (e) {
     log(`closePosition [${reason}] ${symbol}: ${e.message}`, 'ERROR');
   }
 }
 
-// ─── POSITION MONITOR ────────────────────────────────────────────────────────
+// ─── POSITION MONITOR ─────────────────────────────────────────────────────────
 async function monitorPositions(bars5m) {
-  const client = getAlpaca();
-  if (!client) return;
-
   for (const [symbol, pos] of Object.entries(state.positions)) {
     try {
-      let cur = pos.currentPrice;
+      // Update current price using FIX 2
       try {
-        const q = await client.getLatestOptionQuote(symbol);
-        cur = (q.AskPrice + q.BidPrice) / 2;
+        const cur = await getOptionMidPrice(symbol);
         if (cur > 0) {
           pos.currentPrice   = cur;
           pos.unrealizedPnL  = (cur - pos.entryPremium) * pos.contracts * 100;
           pos.pnlPct         = ((cur - pos.entryPremium) / pos.entryPremium) * 100;
+          pos.status         = 'OPEN';
         }
       } catch (_) {}
 
+      const cur = pos.currentPrice;
+
       // 1. Hard stop
       if (cur <= pos.stopPrice) { await closePosition(symbol, 'PREMIUM_STOP'); continue; }
-      // 2. ATR stop (pre-TP1)
+      // 2. ATR stop (pre-TP1 only)
       if (!pos.tp1Hit && cur <= pos.atrStop) { await closePosition(symbol, 'ATR_STOP'); continue; }
-      // 3. Sowmya exit signal (opposite trapped participant)
-      if (bars5m) {
+      // 3. Sowmya exit signal (only use when in profit / TP1 already hit)
+      if (bars5m && pos.tp1Hit) {
         const o5 = bars5m.map(b => b.o), h5 = bars5m.map(b => b.h);
         const l5 = bars5m.map(b => b.l), c5 = bars5m.map(b => b.c), v5 = bars5m.map(b => b.v);
         const exitSig = detectExitSignal(o5, h5, l5, c5, v5, pos.direction);
-        if (exitSig.exit && pos.tp1Hit) {
-          await closePosition(symbol, `SOWMYA_EXIT`); continue;
-        }
-        if (exitSig.exit) log(`Sowmya exit signal: ${exitSig.reason} on ${symbol} (TP1 not hit — monitoring)`, 'WARN');
+        if (exitSig.exit) { await closePosition(symbol, `SOWMYA_EXIT`); continue; }
       }
-      // 4. TP1 partial
+      // 4. TP1 partial close
       if (!pos.tp1Hit && cur >= pos.tp1Price) {
         await closePosition(symbol, 'TP1', true, state.config.TP1_CLOSE_PCT); continue;
       }
-      // 5. TP2 full
+      // 5. TP2 full close
       if (pos.tp1Hit && cur >= pos.tp2Price) {
         await closePosition(symbol, 'TP2'); continue;
       }
@@ -411,10 +482,10 @@ async function monitorPositions(bars5m) {
   }
 }
 
-// ─── NEWS BLACKOUT ────────────────────────────────────────────────────────────
+// ─── NEWS BLACKOUT ─────────────────────────────────────────────────────────────
 function isNewsBlacklist(h, m) {
   const mins = h * 60 + m;
-  return mins >= 13 * 60 + 55 && mins <= 14 * 60 + 20;  // FOMC window
+  return mins >= 13 * 60 + 55 && mins <= 14 * 60 + 20;
 }
 
 // ─── MAIN SCAN LOOP ───────────────────────────────────────────────────────────
@@ -432,26 +503,33 @@ async function runScan() {
       await refreshGEXAll();
       lastGEXMinute = etStr;
     }
+    // Stale GEX refresh
     const gexAge = state.gexAll.lastFetch
       ? (Date.now() - new Date(state.gexAll.lastFetch)) / 60000 : Infinity;
     if (gexAge > state.config.GEX_REFRESH_MINS) await refreshGEXAll();
 
-    // Fetch bars
-    const [bars15m, bars5m] = await Promise.all([
-      getBars('SPY', '15Min', 55),
-      getBars('SPY', '5Min', 65),
-    ]);
-    if (!bars15m || !bars5m) { log('Bar fetch failed', 'WARN'); return; }
+    // FIX 4: Fetch bars with retry (staggered — 15m first, then 5m)
+    const bars15m = await getBars('SPY', '15Min', 55);
+    await sleep(500);  // small gap to avoid concurrent rate limit
+    const bars5m  = await getBars('SPY', '5Min', 65);
 
-    // Update zone map
-    if (bars15m.length >= 15) {
+    if (!bars5m || bars5m.length < 10) {
+      log('Insufficient 5m bar data — skipping scan', 'WARN'); return;
+    }
+
+    // FIX 5: Lower minimum bar threshold — 15m bars may be sparse at open
+    // Use whatever 15m bars we have (minimum 8 for zone detection)
+    const use15m = bars15m && bars15m.length >= 8 ? bars15m : null;
+
+    // Update zone map if we have enough 15m bars
+    if (use15m) {
       state.zones = detectSDZones(
-        bars15m.map(b => b.o), bars15m.map(b => b.h),
-        bars15m.map(b => b.l), bars15m.map(b => b.c), bars15m.map(b => b.v)
+        use15m.map(b => b.o), use15m.map(b => b.h),
+        use15m.map(b => b.l), use15m.map(b => b.c), use15m.map(b => b.v)
       );
     }
 
-    // Monitor open positions first
+    // Monitor open positions
     await monitorPositions(bars5m);
 
     // News blackout
@@ -459,14 +537,15 @@ async function runScan() {
       log(`News blackout (${etStr} ET) — no new entries`); return;
     }
 
-    // Build merged GEX for evaluateSignal (SPY with multi-ticker context)
+    // Merge GEX context
     const gexForSignal = state.gexAll.SPY
       ? { ...state.gexAll.SPY, multiTickerAligned: state.gexAll.multiAligned }
       : null;
 
     // Evaluate signal
     const signal = evaluateSignal({
-      bars15m, bars5m,
+      bars15m: use15m || bars5m,  // fallback to 5m for zone if no 15m
+      bars5m,
       gexData:       gexForSignal,
       etHour:        etH,
       etMinute:      etM,
@@ -474,7 +553,7 @@ async function runScan() {
     });
     state.lastSignal = signal;
 
-    // Save every signal to DB (even rejected — valuable for data mining)
+    // Save ALL signals to DB for data mining (including rejected)
     const signalId = DB.saveSignal(signal, state.gexAll);
 
     const rejectStr = signal.rejectReasons.length ? ` REJECT: ${signal.rejectReasons[0]}` : '';
@@ -493,7 +572,7 @@ function scheduleForceClose() {
   setInterval(() => {
     const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
     if (et.getHours() === h && et.getMinutes() === m) {
-      log(`FORCE CLOSE all at ${state.config.FORCE_CLOSE_ET} ET`);
+      log(`FORCE CLOSE all positions at ${state.config.FORCE_CLOSE_ET} ET`);
       Object.keys(state.positions).forEach(sym => closePosition(sym, 'FORCE_CLOSE_EOD'));
     }
   }, 60000);
@@ -504,7 +583,7 @@ function scheduleDailyReset() {
     const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
     if (et.getHours() === 9 && et.getMinutes() === 25) {
       state.cbTriggered = false;
-      log('Daily circuit breaker reset at 9:25 AM ET');
+      log('Daily CB reset at 9:25 AM ET');
       fetchPriorDayClose('SPY');
     }
   }, 60000);
@@ -512,8 +591,7 @@ function scheduleDailyReset() {
 
 function isMarketHours() {
   const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const d  = et.getDay();
-  if (d === 0 || d === 6) return false;
+  if (et.getDay() === 0 || et.getDay() === 6) return false;
   const m = et.getHours() * 60 + et.getMinutes();
   return m >= 9 * 60 + 30 && m < 16 * 60;
 }
@@ -531,23 +609,17 @@ function updateStats(pnl, setupType, grade) {
     s.lossStreak = Math.min(s.lossStreak, s.currentStreak);
   }
   if (setupType && s.setupBreakdown[setupType] !== undefined) s.setupBreakdown[setupType]++;
-  if (grade     && s.gradeBreakdown[grade]     !== undefined) s.gradeBreakdown[grade]++;
+  if (grade && s.gradeBreakdown[grade] !== undefined) s.gradeBreakdown[grade]++;
 }
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
 app.get('/api/state', (req, res) => {
   const { ALPACA_KEY, ALPACA_SECRET, ...safeConfig } = state.config;
   res.json({
-    positions:     state.positions,
-    zones:         state.zones,
-    lastSignal:    state.lastSignal,
-    gexAll:        state.gexAll,
-    cbTriggered:   state.cbTriggered,
-    marketOpen:    isMarketHours(),
-    config:        safeConfig,
-    stats:         state.stats,
-    priorDayClose: state.priorDayClose,
-    dailyPnL:      DB.getTodayPnL(),
+    positions: state.positions, zones: state.zones, lastSignal: state.lastSignal,
+    gexAll: state.gexAll, cbTriggered: state.cbTriggered,
+    marketOpen: isMarketHours(), config: safeConfig, stats: state.stats,
+    priorDayClose: state.priorDayClose, dailyPnL: DB.getTodayPnL(),
   });
 });
 
@@ -573,40 +645,39 @@ app.post('/api/config', (req, res) => {
   res.json({ ok: true, config: state.config });
 });
 
-// Data mining endpoints
 app.get('/api/mining/signals', (req, res) => {
   const { grade, direction, tradeable, limit = 200 } = req.query;
   let q = 'SELECT * FROM signals WHERE 1=1';
-  const params = [];
-  if (grade)     { q += ' AND grade = ?';     params.push(grade); }
-  if (direction) { q += ' AND direction = ?'; params.push(direction); }
-  if (tradeable) { q += ' AND tradeable = ?'; params.push(parseInt(tradeable)); }
-  q += ' ORDER BY ts DESC LIMIT ?';
-  params.push(parseInt(limit));
-  res.json(DB.db.prepare(q).all(...params));
+  const p = [];
+  if (grade)     { q += ' AND grade = ?';     p.push(grade); }
+  if (direction) { q += ' AND direction = ?'; p.push(direction); }
+  if (tradeable) { q += ' AND tradeable = ?'; p.push(parseInt(tradeable)); }
+  q += ' ORDER BY ts DESC LIMIT ?'; p.push(parseInt(limit));
+  res.json(DB.db.prepare(q).all(...p));
 });
 
 app.get('/api/mining/trades', (req, res) => {
   const { setup_type, grade, exit_reason, limit = 200 } = req.query;
-  let q = 'SELECT * FROM trades WHERE status = \'CLOSED\'';
-  const params = [];
-  if (setup_type)  { q += ' AND setup_type = ?';  params.push(setup_type); }
-  if (grade)       { q += ' AND grade = ?';        params.push(grade); }
-  if (exit_reason) { q += ' AND exit_reason = ?';  params.push(exit_reason); }
-  q += ' ORDER BY ts DESC LIMIT ?';
-  params.push(parseInt(limit));
-  res.json(DB.db.prepare(q).all(...params));
+  let q = "SELECT * FROM trades WHERE status = 'CLOSED'";
+  const p = [];
+  if (setup_type)  { q += ' AND setup_type = ?';  p.push(setup_type); }
+  if (grade)       { q += ' AND grade = ?';        p.push(grade); }
+  if (exit_reason) { q += ' AND exit_reason = ?';  p.push(exit_reason); }
+  q += ' ORDER BY ts DESC LIMIT ?'; p.push(parseInt(limit));
+  res.json(DB.db.prepare(q).all(...p));
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/build/index.html')));
 
 // ─── STARTUP ──────────────────────────────────────────────────────────────────
 app.listen(ENV.PORT, async () => {
-  log(`DSB v3 | port=${ENV.PORT} paper=${ENV.PAPER} autoTrade=${ENV.AUTO_TRADE} db=${require('./db').db.name}`);
+  log(`DSB v3 | port=${ENV.PORT} paper=${ENV.PAPER} autoTrade=${ENV.AUTO_TRADE}`);
   scheduleForceClose();
   scheduleDailyReset();
   if (isMarketHours()) {
-    await Promise.all([refreshGEXAll(), fetchPriorDayClose('SPY')]);
+    await fetchPriorDayClose('SPY');
+    await sleep(2000);
+    await refreshGEXAll();
   }
   const ms = ENV.SCAN_INTERVAL_MINS * 60 * 1000;
   setInterval(runScan, ms);

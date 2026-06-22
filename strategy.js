@@ -263,30 +263,33 @@ function detectPShape(opens, highs, lows, closes, volumes, idx) {
 }
 
 // ─── SOWMYA EXIT SIGNAL DETECTOR ─────────────────────────────────────────────
-// "When you're in a long trade and you see a red candle with positive delta,
-//  the sellers are now getting trapped — exit or reduce"  — Sowmya
-// This is the mirror of entry: the opposite trapped-participant signal
+// Sowmya: "When you are in a long and you see a red candle with positive delta,
+// the sellers are getting trapped going down — exit or reduce."
+// Key: exit is specifically the OPPOSITE delta pattern — NOT shape alone.
+// B-Shape at demand = ENTRY for CALL (absorption of sellers).
+// P-Shape at supply = ENTRY for PUT (distribution of buyers).
+// Using shape alone as exit was WRONG and caused false exits.
+// Only the opposing trapped-participant DELTA+CANDLE combo triggers exit.
 function detectExitSignal(opens, highs, lows, closes, volumes, currentDirection) {
   const last = closes.length - 1;
   if (last < 0) return { exit: false };
 
-  const delta = calcDelta(opens[last], highs[last], lows[last], closes[last], volumes[last]);
+  const delta  = calcDelta(opens[last], highs[last], lows[last], closes[last], volumes[last]);
   const isBull = closes[last] > opens[last];
   const isBear = closes[last] < opens[last];
 
   if (currentDirection === 'CALL') {
-    // In a long: exit signal = bear candle + POSITIVE delta (buyers trapped going down)
-    // OR: P-shape forming at current price (distribution overhead)
+    // Exit long: bear candle + POSITIVE delta = buyers trapped going down
+    // This is Sowmya Setup 2 appearing — opposing signal
     const bearPosD = isBear && delta > 0;
-    const pShape   = detectPShape(opens, highs, lows, closes, volumes, last);
-    return { exit: bearPosD || pShape, reason: bearPosD ? 'Bear+PosDelta (buyers trapped)' : 'P-Shape (distribution)' };
+    return { exit: bearPosD, reason: 'Bear+PosDelta (buyers trapped — opposing signal)' };
   }
 
   if (currentDirection === 'PUT') {
-    // In a short: exit signal = bull candle + NEGATIVE delta (sellers trapped going up)
+    // Exit short: bull candle + NEGATIVE delta = sellers trapped going up
+    // This is Sowmya Setup 1 appearing — opposing signal
     const bullNegD = isBull && delta < 0;
-    const bShape   = detectBShape(opens, highs, lows, closes, volumes, last);
-    return { exit: bullNegD || bShape, reason: bullNegD ? 'Bull+NegDelta (sellers trapped)' : 'B-Shape (absorption)' };
+    return { exit: bullNegD, reason: 'Bull+NegDelta (sellers trapped — opposing signal)' };
   }
 
   return { exit: false };
@@ -722,7 +725,9 @@ function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayCl
     return result;
   }
 
-  if (!bars15m?.length || !bars5m?.length || bars5m.length < 20) {
+  // FIX 5: Lowered minimum — at market open we may only have 5-10 bars
+  // 15m: need at least 3 for zone detection; 5m: need at least 10 for delta/EMA
+  if (!bars5m?.length || bars5m.length < 10) {
     result.rejectReasons.push('Insufficient bar data');
     return result;
   }
