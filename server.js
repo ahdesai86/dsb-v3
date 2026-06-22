@@ -667,18 +667,64 @@ app.get('/api/mining/trades', (req, res) => {
   res.json(DB.db.prepare(q).all(...p));
 });
 
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+// MUST be registered BEFORE the catch-all '*' route below — Express matches
+// routes in registration order, and a wildcard route placed first will
+// swallow every request including this one, hiding healthcheck failures
+// behind a generic 404/500 from the static-file fallback.
+app.get('/healthz', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    uptime_s: Math.round(process.uptime()),
+    marketOpen: isMarketHours(),
+    dbAvailable: DB.isAvailable(),
+    alpacaConfigured: !!state.config.ALPACA_KEY,
+  });
+});
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/build/index.html')));
 
+// ─── PROCESS-LEVEL SAFETY NET ─────────────────────────────────────────────────
+// If anything throws outside of a try/catch (a bug we haven't anticipated),
+// log it loudly to stdout/stderr BEFORE the process dies, so it shows up in
+// Railway's deploy logs / CLI logs instead of vanishing silently. We do NOT
+// swallow the error — Node will still exit on uncaughtException, which is
+// correct (the alternative, continuing in an unknown state, is worse) — but
+// at least the cause will be visible. Railway's restart policy (ON_FAILURE,
+// max 3 retries) will restart the container after this.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err.stack || err.message);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection:', reason?.stack || reason);
+  process.exit(1);
+});
+
 // ─── STARTUP ──────────────────────────────────────────────────────────────────
-app.listen(ENV.PORT, async () => {
-  log(`DSB v3 | port=${ENV.PORT} paper=${ENV.PAPER} autoTrade=${ENV.AUTO_TRADE}`);
+// Bind the port FIRST, synchronously, before any async work (GEX fetch,
+// prior-day-close fetch). This is what lets Railway's health check pass
+// immediately even if Alpaca is slow or briefly unreachable on cold start.
+app.listen(ENV.PORT, () => {
+  log(`DSB v3 | port=${ENV.PORT} paper=${ENV.PAPER} autoTrade=${ENV.AUTO_TRADE} dbAvailable=${DB.isAvailable()}`);
   scheduleForceClose();
   scheduleDailyReset();
-  if (isMarketHours()) {
-    await fetchPriorDayClose('SPY');
-    await sleep(2000);
-    await refreshGEXAll();
-  }
+
+  // Run startup data fetches async, AFTER the port is already listening.
+  // Wrapped in its own try/catch so a slow/broken Alpaca connection at
+  // boot cannot prevent the health check from passing.
+  (async () => {
+    try {
+      if (isMarketHours()) {
+        await fetchPriorDayClose('SPY');
+        await sleep(2000);
+        await refreshGEXAll();
+      }
+    } catch (e) {
+      log(`Startup data fetch failed (non-fatal): ${e.message}`, 'ERROR');
+    }
+  })();
+
   const ms = ENV.SCAN_INTERVAL_MINS * 60 * 1000;
   setInterval(runScan, ms);
   setTimeout(runScan, 5000);
