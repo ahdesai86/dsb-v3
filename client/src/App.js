@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 
 const C = {
   bg:"#04070e", panel:"#080f1a", panelB:"#0b1422", border:"#112030",
@@ -160,6 +160,12 @@ function SignalPanel({signal}) {
         </div>
       )}
       {signal.zoneHit?.hit&&<div style={{display:'flex',alignItems:'center',gap:8}}><Pill color={signal.zoneHit.type==='demand'?C.green:C.red}>{signal.zoneHit.type==='demand'?'▲ AT DEMAND':'▼ AT SUPPLY'}</Pill>{signal.zoneHit.zone&&<span style={{fontSize:10,color:C.dim}}>${signal.zoneHit.zone.bottom?.toFixed(2)} – ${signal.zoneHit.zone.top?.toFixed(2)}</span>}</div>}
+      {signal.meta?.confluenceSummary&&(
+        <div style={{padding:'7px 10px',background:C.panelB,borderRadius:5,border:`1px solid ${C.accent}33`,fontSize:10,color:C.text,lineHeight:1.5}}>
+          <span style={{color:C.accent,fontWeight:700,fontSize:9,textTransform:'uppercase',letterSpacing:0.8}}>Why this fired: </span>
+          {signal.meta.confluenceSummary}
+        </div>
+      )}
       <div style={{display:'flex',gap:12,flexWrap:'wrap',fontSize:10,color:C.dim}}>
         {signal.meta?.sessionVWAP&&<span>VWAP: <span style={{color:C.yellow}}>{fmt.price(signal.meta.sessionVWAP)}</span></span>}
         {signal.meta?.ema9&&<span>EMA9: <span style={{color:C.accent}}>{fmt.price(signal.meta.ema9)}</span></span>}
@@ -180,29 +186,45 @@ function SignalPanel({signal}) {
 }
 
 // ── Positions ────────────────────────────────────────────────────────────────
+// Click a row to expand/collapse the full confluence explanation — keeps the
+// main table compact while still surfacing the WHY behind every open trade.
 function Positions({positions, onClose}) {
   const pos=Object.values(positions||{});
+  const [expanded, setExpanded] = useState(null);
   if (!pos.length) return <div style={{padding:24,color:C.dim,fontSize:11,textAlign:'center'}}>No open positions</div>;
   return (
     <div style={{overflowX:'auto'}}>
       <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
-        <thead><tr style={{borderBottom:`1px solid ${C.border}`}}>{['Symbol','Dir','Grade','Qty','Entry','Current','P/L','Stop','TP1','TP2','Setup',''].map(h=><th key={h} style={{padding:'5px 8px',color:C.dim,textAlign:'left',fontSize:8,textTransform:'uppercase',letterSpacing:0.8,whiteSpace:'nowrap'}}>{h}</th>)}</tr></thead>
+        <thead><tr style={{borderBottom:`1px solid ${C.border}`}}>{['Symbol','Dir','Grade','Qty','Entry','Current','Max','Min','P/L','Stop','TP1','TP2','Setup',''].map(h=><th key={h} style={{padding:'5px 8px',color:C.dim,textAlign:'left',fontSize:8,textTransform:'uppercase',letterSpacing:0.8,whiteSpace:'nowrap'}}>{h}</th>)}</tr></thead>
         <tbody>{pos.map(p=>{
           const pC=(p.unrealizedPnL||0)>0?C.green:(p.unrealizedPnL||0)<0?C.red:C.dim;
-          return <tr key={p.symbol} style={{borderBottom:`1px solid ${C.border}18`}}>
-            <td style={{padding:'6px 8px',color:C.accent,fontWeight:700,fontSize:9}}>{p.symbol?.slice(-14)}</td>
-            <td style={{padding:'6px 8px'}}><Pill color={p.direction==='CALL'?C.green:C.red} sm>{p.direction}</Pill></td>
-            <td style={{padding:'6px 8px'}}><Pill color={p.grade==='A+'?C.green:p.grade==='A'?C.accent:C.yellow} sm>{p.grade}</Pill></td>
-            <td style={{padding:'6px 8px',color:C.text}}>{p.contracts}x</td>
-            <td style={{padding:'6px 8px',color:C.text}}>{fmt.price(p.entryPremium)}</td>
-            <td style={{padding:'6px 8px',color:C.text}}>{fmt.price(p.currentPrice)}</td>
-            <td style={{padding:'6px 8px',color:pC,fontWeight:700}}>{fmt.pct(p.pnlPct)}<span style={{fontSize:8,marginLeft:3}}>({fmt.usd(p.unrealizedPnL)})</span></td>
-            <td style={{padding:'6px 8px',color:C.red,fontSize:9}}>{fmt.price(p.stopPrice)}</td>
-            <td style={{padding:'6px 8px',color:C.yellow,fontSize:9}}>{fmt.price(p.tp1Price)}</td>
-            <td style={{padding:'6px 8px',color:C.green,fontSize:9}}>{fmt.price(p.tp2Price)}</td>
-            <td style={{padding:'6px 8px',color:C.dim,fontSize:9}}>{p.setupType}</td>
-            <td style={{padding:'6px 8px'}}><button onClick={()=>onClose(p.symbol)} style={{padding:'2px 8px',fontSize:9,background:C.redD,border:`1px solid ${C.red}44`,color:C.red,borderRadius:3,cursor:'pointer',fontFamily:'inherit'}}>✕</button></td>
-          </tr>;
+          const isOpen = expanded === p.symbol;
+          return <React.Fragment key={p.symbol}>
+            <tr onClick={()=>setExpanded(isOpen?null:p.symbol)} style={{borderBottom:isOpen?'none':`1px solid ${C.border}18`,cursor:'pointer'}}>
+              <td style={{padding:'6px 8px',color:C.accent,fontWeight:700,fontSize:9}}>{isOpen?'▾ ':'▸ '}{p.symbol?.slice(-14)}</td>
+              <td style={{padding:'6px 8px'}}><Pill color={p.direction==='CALL'?C.green:C.red} sm>{p.direction}</Pill></td>
+              <td style={{padding:'6px 8px'}}><Pill color={p.grade==='A+'?C.green:p.grade==='A'?C.accent:C.yellow} sm>{p.grade}</Pill></td>
+              <td style={{padding:'6px 8px',color:C.text}}>{p.contracts}x</td>
+              <td style={{padding:'6px 8px',color:C.text}}>{fmt.price(p.entryPremium)}</td>
+              <td style={{padding:'6px 8px',color:C.text}}>{fmt.price(p.currentPrice)}</td>
+              <td style={{padding:'6px 8px',color:C.green,fontSize:9}} title='Highest premium seen while held'>{fmt.price(p.maxPremium)}</td>
+              <td style={{padding:'6px 8px',color:C.red,fontSize:9}} title='Lowest premium seen while held'>{fmt.price(p.minPremium)}</td>
+              <td style={{padding:'6px 8px',color:pC,fontWeight:700}}>{fmt.pct(p.pnlPct)}<span style={{fontSize:8,marginLeft:3}}>({fmt.usd(p.unrealizedPnL)})</span></td>
+              <td style={{padding:'6px 8px',color:C.red,fontSize:9}}>{fmt.price(p.stopPrice)}</td>
+              <td style={{padding:'6px 8px',color:C.yellow,fontSize:9}}>{fmt.price(p.tp1Price)}</td>
+              <td style={{padding:'6px 8px',color:C.green,fontSize:9}}>{fmt.price(p.tp2Price)}</td>
+              <td style={{padding:'6px 8px',color:C.dim,fontSize:9}}>{p.setupType}</td>
+              <td style={{padding:'6px 8px'}}><button onClick={(e)=>{e.stopPropagation();onClose(p.symbol);}} style={{padding:'2px 8px',fontSize:9,background:C.redD,border:`1px solid ${C.red}44`,color:C.red,borderRadius:3,cursor:'pointer',fontFamily:'inherit'}}>✕</button></td>
+            </tr>
+            {isOpen&&(
+              <tr style={{borderBottom:`1px solid ${C.border}18`}}>
+                <td colSpan={14} style={{padding:'8px 14px',background:C.panelB}}>
+                  <div style={{fontSize:9,color:C.accent,fontWeight:700,textTransform:'uppercase',letterSpacing:0.8,marginBottom:3}}>Entry confluence</div>
+                  <div style={{fontSize:10,color:C.text,lineHeight:1.5}}>{p.confluenceSummary || p.setupDesc || 'No confluence summary recorded'}</div>
+                </td>
+              </tr>
+            )}
+          </React.Fragment>;
         })}</tbody>
       </table>
     </div>
@@ -210,26 +232,58 @@ function Positions({positions, onClose}) {
 }
 
 // ── Trades ───────────────────────────────────────────────────────────────────
+// trades comes from /api/trades as one row per DB record (ENTRY and EXIT are
+// the SAME row — updated in place — since saveTradeEntry inserts and
+// saveTradeExit UPDATEs the same trade_id row rather than adding a new one).
+// So each item already has both entry (premium/limit_price) and exit
+// (exit_price) fields plus max/min watermark and pnl on a single record.
 function Trades({trades}) {
+  const [expanded, setExpanded] = useState(null);
   if (!trades?.length) return <div style={{padding:24,color:C.dim,fontSize:11,textAlign:'center'}}>No trades yet</div>;
   return (
-    <div style={{maxHeight:300,overflowY:'auto'}}>
+    <div style={{maxHeight:320,overflowY:'auto'}}>
       <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
-        <thead style={{position:'sticky',top:0,background:C.panel}}><tr style={{borderBottom:`1px solid ${C.border}`}}>{['Time','Symbol','Event','Dir','Grade','Setup','Qty','Price','P/L','Exit Reason'].map(h=><th key={h} style={{padding:'4px 7px',color:C.dim,textAlign:'left',fontSize:8,textTransform:'uppercase',letterSpacing:0.8}}>{h}</th>)}</tr></thead>
+        <thead style={{position:'sticky',top:0,background:C.panel}}><tr style={{borderBottom:`1px solid ${C.border}`}}>{['Time','Symbol','Status','Dir','Grade','Setup','Qty','Entry','Exit','Max','Min','P/L','Exit Reason'].map(h=><th key={h} style={{padding:'4px 7px',color:C.dim,textAlign:'left',fontSize:8,textTransform:'uppercase',letterSpacing:0.8,whiteSpace:'nowrap'}}>{h}</th>)}</tr></thead>
         <tbody>{trades.map(t=>{
           const pC=(t.pnl||0)>0?C.green:(t.pnl||0)<0?C.red:C.dim;
-          return <tr key={t.id} style={{borderBottom:`1px solid ${C.border}14`}}>
-            <td style={{padding:'4px 7px',color:C.dim,whiteSpace:'nowrap',fontSize:9}}>{fmt.time(t.ts)}</td>
-            <td style={{padding:'4px 7px',color:C.accent,fontSize:8}}>{t.option_symbol?.slice(-12)||t.ticker}</td>
-            <td style={{padding:'4px 7px'}}><Pill color={t.event==='ENTRY'?C.accent:C.yellow} sm>{t.event}</Pill></td>
-            <td style={{padding:'4px 7px'}}><Pill color={t.direction==='CALL'?C.green:C.red} sm>{t.direction}</Pill></td>
-            <td style={{padding:'4px 7px'}}><Pill color={t.grade==='A+'?C.green:t.grade==='A'?C.accent:C.yellow} sm>{t.grade||'—'}</Pill></td>
-            <td style={{padding:'4px 7px',color:C.dim,fontSize:9}}>{t.setup_type||'—'}</td>
-            <td style={{padding:'4px 7px',color:C.text}}>{t.contracts}x</td>
-            <td style={{padding:'4px 7px',color:C.text}}>{fmt.price(t.premium||t.exit_price)}</td>
-            <td style={{padding:'4px 7px',color:pC,fontWeight:700}}>{t.pnl!=null?fmt.usd(t.pnl):'—'}</td>
-            <td style={{padding:'4px 7px',color:C.dim,fontSize:8}}>{t.exit_reason||'—'}</td>
-          </tr>;
+          const entryVal = t.limit_price ?? t.premium;
+          const isOpen = expanded === t.id;
+          const hasDetail = !!(t.confluence_summary || t.exit_strategy_label);
+          return <React.Fragment key={t.id}>
+            <tr onClick={()=>hasDetail&&setExpanded(isOpen?null:t.id)} style={{borderBottom:isOpen?'none':`1px solid ${C.border}14`,cursor:hasDetail?'pointer':'default'}}>
+              <td style={{padding:'4px 7px',color:C.dim,whiteSpace:'nowrap',fontSize:9}}>{hasDetail?(isOpen?'▾ ':'▸ '):''}{fmt.time(t.ts)}</td>
+              <td style={{padding:'4px 7px',color:C.accent,fontSize:8}}>{t.option_symbol?.slice(-12)||t.ticker}</td>
+              <td style={{padding:'4px 7px'}}><Pill color={t.status==='CLOSED'?C.dim:C.green} sm>{t.status||'—'}</Pill></td>
+              <td style={{padding:'4px 7px'}}><Pill color={t.direction==='CALL'?C.green:C.red} sm>{t.direction}</Pill></td>
+              <td style={{padding:'4px 7px'}}><Pill color={t.grade==='A+'?C.green:t.grade==='A'?C.accent:C.yellow} sm>{t.grade||'—'}</Pill></td>
+              <td style={{padding:'4px 7px',color:C.dim,fontSize:9}}>{t.setup_type||'—'}</td>
+              <td style={{padding:'4px 7px',color:C.text}}>{t.contracts}x</td>
+              <td style={{padding:'4px 7px',color:C.text,fontWeight:700}}>{fmt.price(entryVal)}</td>
+              <td style={{padding:'4px 7px',color:t.exit_price!=null?C.text:C.faint,fontWeight:700}}>{t.exit_price!=null?fmt.price(t.exit_price):'open'}</td>
+              <td style={{padding:'4px 7px',color:C.green,fontSize:9}} title='Highest premium seen while held'>{fmt.price(t.max_premium)}</td>
+              <td style={{padding:'4px 7px',color:C.red,fontSize:9}} title='Lowest premium seen while held'>{fmt.price(t.min_premium)}</td>
+              <td style={{padding:'4px 7px',color:pC,fontWeight:700}}>{t.pnl!=null?fmt.usd(t.pnl):'—'}{t.pnl_pct!=null&&<span style={{fontSize:8,marginLeft:3,opacity:0.8}}>({fmt.pct(t.pnl_pct)})</span>}</td>
+              <td style={{padding:'4px 7px',color:C.dim,fontSize:8}} title={t.exit_strategy_label||''}>{t.exit_reason||'—'}</td>
+            </tr>
+            {isOpen&&hasDetail&&(
+              <tr style={{borderBottom:`1px solid ${C.border}14`}}>
+                <td colSpan={13} style={{padding:'8px 14px',background:C.panelB}}>
+                  {t.confluence_summary&&(
+                    <div style={{marginBottom:t.exit_strategy_label?6:0}}>
+                      <div style={{fontSize:9,color:C.accent,fontWeight:700,textTransform:'uppercase',letterSpacing:0.8,marginBottom:2}}>Entry confluence</div>
+                      <div style={{fontSize:10,color:C.text,lineHeight:1.5}}>{t.confluence_summary}</div>
+                    </div>
+                  )}
+                  {t.exit_strategy_label&&(
+                    <div>
+                      <div style={{fontSize:9,color:C.yellow,fontWeight:700,textTransform:'uppercase',letterSpacing:0.8,marginBottom:2}}>Exit strategy</div>
+                      <div style={{fontSize:10,color:C.text,lineHeight:1.5}}>{t.exit_strategy_label}</div>
+                    </div>
+                  )}
+                </td>
+              </tr>
+            )}
+          </React.Fragment>;
         })}</tbody>
       </table>
     </div>
