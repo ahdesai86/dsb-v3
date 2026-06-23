@@ -707,6 +707,53 @@ function isValidTradingTime(etHour, etMinute) {
   return w1 || w2;
 }
 
+// ─── HUMAN-READABLE CONFLUENCE SUMMARY ────────────────────────────────────────
+// Builds a single plain-English string describing WHY a trade fired —
+// the S&D zone, the Sowmya footprint setup, and every confluence factor
+// that contributed to the score (GEX regime/flip/walls, VWAP, EMA, ATR, etc).
+// Used in logs and the dashboard so every trade is self-explanatory without
+// having to cross-reference the strategy code.
+function buildConfluenceSummary(setup, zoneHit, gexAnalysis, addlConf) {
+  const parts = [];
+
+  if (zoneHit?.type) {
+    parts.push(`${zoneHit.type === 'demand' ? 'Demand zone' : 'Supply zone'} hit`);
+  }
+  if (setup) {
+    parts.push(setup.desc || setup.label || setup.type);
+  }
+
+  const gexLabels  = (gexAnalysis?.details  || []).filter(d => d.weight > 0).map(d => d.label);
+  const addlLabels = (addlConf?.details     || []).filter(d => d.weight > 0).map(d => d.label);
+
+  if (gexLabels.length)  parts.push(...gexLabels);
+  if (addlLabels.length) parts.push(...addlLabels);
+
+  return parts.join(' + ');
+}
+
+// ─── EXIT STRATEGY LABELS ──────────────────────────────────────────────────────
+// Maps the internal exit reason code (used for DB filtering / programmatic
+// logic) to a plain-English explanation of WHY the position was closed —
+// surfaced in logs and the dashboard so exits are as self-explanatory as
+// entries. Keep this in strategy.js (not server.js) since it documents
+// strategy semantics, not infrastructure.
+const EXIT_STRATEGY_LABELS = {
+  PREMIUM_STOP:    'Hard stop — premium fell below the stop-loss threshold (Sowmya: SL below/above footprint candle)',
+  ATR_STOP:        'ATR stop — premium fell below the volatility-adjusted stop before TP1 was reached',
+  SOWMYA_EXIT:     'Opposing signal — opposite trapped-participant pattern appeared (Sowmya exit rule)',
+  TP1:             'Take-profit 1 — partial close at first target, stop trailed to breakeven',
+  TP2:             'Take-profit 2 — full close at second target',
+  FORCE_CLOSE_EOD: 'End-of-day force close — held past the configured force-close time',
+  MANUAL:          'Manually closed from the dashboard',
+};
+
+function getExitStrategyLabel(reasonCode) {
+  // Strip any dynamic suffix (e.g. legacy SOWMYA_EXIT_BEAR_POSDELTA) back to its base key
+  const baseKey = Object.keys(EXIT_STRATEGY_LABELS).find(k => reasonCode?.startsWith(k));
+  return EXIT_STRATEGY_LABELS[baseKey] || reasonCode || 'Unknown exit reason';
+}
+
 // ─── MASTER SIGNAL EVALUATOR ──────────────────────────────────────────────────
 // Combines all layers: time → zones → footprint → GEX → additional
 //
@@ -826,6 +873,9 @@ function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayCl
     wallAbove:    gexData?.wallAbove,
     wallBelow:    gexData?.wallBelow,
     concentration: gexData?.concentration,
+    // Plain-English summary of every confluence factor that fired —
+    // shown in logs and dashboard so each trade is self-explanatory.
+    confluenceSummary: buildConfluenceSummary(setup, zoneHit, result.gexAnalysis, addlConf),
   };
 
   // ── Tradeable threshold ───────────────────────────────────────────────────
@@ -857,4 +907,8 @@ module.exports = {
   vwap, ema, atr, sma,
   calcDelta, calcDeltaSeries,
   detectBShape, detectPShape,
+  // Confluence + exit-strategy explanations (logs/dashboard)
+  buildConfluenceSummary,
+  getExitStrategyLabel,
+  EXIT_STRATEGY_LABELS,
 };

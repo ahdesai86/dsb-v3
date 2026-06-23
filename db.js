@@ -132,9 +132,13 @@ if (db) {
         exit_ts         TEXT,
         exit_price      REAL,
         exit_reason     TEXT,
+        exit_strategy_label TEXT,  -- plain-English exit explanation (e.g. 'Take-profit 1...')
         pnl             REAL,
         pnl_pct         REAL,
         hold_minutes    REAL,
+        max_premium     REAL,   -- highest option premium observed while held
+        min_premium     REAL,   -- lowest option premium observed while held
+        confluence_summary TEXT, -- plain-English WHY this trade fired (zone + setup + confluence factors)
         status          TEXT    DEFAULT 'PENDING',
         signal_id       INTEGER,
         FOREIGN KEY (signal_id) REFERENCES signals(id)
@@ -218,25 +222,37 @@ if (db) {
         strike, expiry, spot_at_entry, premium, limit_price, stop_price,
         atr_stop, tp1_price, tp2_price, gex_tp1, grade, confidence,
         setup_type, setup_desc, delta, has_bshape, has_pshape,
-        zone_type, gex_regime, gex_flags, status, signal_id
+        zone_type, gex_regime, gex_flags, status, signal_id,
+        max_premium, min_premium, confluence_summary
       ) VALUES (
         @trade_id, @ts, @event, @ticker, @option_symbol, @direction, @contracts,
         @strike, @expiry, @spot_at_entry, @premium, @limit_price, @stop_price,
         @atr_stop, @tp1_price, @tp2_price, @gex_tp1, @grade, @confidence,
         @setup_type, @setup_desc, @delta, @has_bshape, @has_pshape,
-        @zone_type, @gex_regime, @gex_flags, @status, @signal_id
+        @zone_type, @gex_regime, @gex_flags, @status, @signal_id,
+        @max_premium, @min_premium, @confluence_summary
       )
+    `);
+
+    // Updates the running watermark on an OPEN trade row without touching
+    // exit fields — called on every 1-min position poll, not just on close.
+    stmts.updateTradeWatermark = db.prepare(`
+      UPDATE trades SET max_premium = @max_premium, min_premium = @min_premium
+      WHERE trade_id = @trade_id
     `);
 
     stmts.updateTradeExit = db.prepare(`
       UPDATE trades SET
-        exit_ts      = @exit_ts,
-        exit_price   = @exit_price,
-        exit_reason  = @exit_reason,
-        pnl          = @pnl,
-        pnl_pct      = @pnl_pct,
-        hold_minutes = @hold_minutes,
-        status       = 'CLOSED'
+        exit_ts             = @exit_ts,
+        exit_price          = @exit_price,
+        exit_reason         = @exit_reason,
+        exit_strategy_label = @exit_strategy_label,
+        pnl                 = @pnl,
+        pnl_pct             = @pnl_pct,
+        hold_minutes        = @hold_minutes,
+        max_premium         = @max_premium,
+        min_premium         = @min_premium,
+        status              = 'CLOSED'
       WHERE trade_id = @trade_id
     `);
 
@@ -369,21 +385,37 @@ const saveTradeEntry = safe((pos, signalId) => {
     gex_flags:     JSON.stringify(pos.gexFlags || []),
     status:        'OPEN',
     signal_id:     signalId || null,
+    max_premium:   pos.maxPremium ?? pos.entryPremium,
+    min_premium:   pos.minPremium ?? pos.entryPremium,
+    confluence_summary: pos.confluenceSummary || pos.setupDesc || null,
   });
 }, undefined);
 
-const saveTradeExit = safe((tradeId, exitPrice, entryPrice, reason, entryTime, contracts) => {
+// Called every 1-min position poll to persist the running high/low so it
+// survives a server restart while the position is still open.
+const updateTradeWatermark = safe((tradeId, maxPremium, minPremium) => {
+  stmts.updateTradeWatermark.run({
+    trade_id:    tradeId,
+    max_premium: maxPremium,
+    min_premium: minPremium,
+  });
+}, undefined);
+
+const saveTradeExit = safe((tradeId, exitPrice, entryPrice, reason, entryTime, contracts, maxPremium, minPremium, exitStrategyLabel) => {
   const pnl      = (exitPrice - entryPrice) * contracts * 100;
   const pnlPct   = ((exitPrice - entryPrice) / entryPrice) * 100;
   const holdMins = (Date.now() - new Date(entryTime).getTime()) / 60000;
   stmts.updateTradeExit.run({
-    trade_id:     tradeId,
-    exit_ts:      new Date().toISOString(),
-    exit_price:   exitPrice,
-    exit_reason:  reason,
+    trade_id:            tradeId,
+    exit_ts:             new Date().toISOString(),
+    exit_price:          exitPrice,
+    exit_reason:         reason,
+    exit_strategy_label: exitStrategyLabel || reason || null,
     pnl,
     pnl_pct:      pnlPct,
     hold_minutes: holdMins,
+    max_premium:  Math.max(maxPremium ?? exitPrice, exitPrice),
+    min_premium:  Math.min(minPremium ?? exitPrice, exitPrice),
   });
 }, undefined);
 
@@ -522,6 +554,7 @@ module.exports = {
   saveSignal,
   saveTradeEntry,
   saveTradeExit,
+  updateTradeWatermark,
   saveGEXSnap,
   saveBars,
   getRecentSignals,

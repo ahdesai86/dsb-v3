@@ -34,6 +34,7 @@ const {
   calcGEXLevels,
   detectExitSignal,
   isValidTradingTime,
+  getExitStrategyLabel,
 } = require('./strategy');
 const DB = require('./db');
 
@@ -414,6 +415,8 @@ async function placeEntry(signal, signalId) {
       client_order_id: `DSB3_ENTRY_${signal.setup?.type}_${Date.now()}`,
     });
 
+    const confluenceSummary = signal.meta?.confluenceSummary || signal.setup?.desc || '(no confluence summary available)';
+
     const pos = {
       id: order.id, clientOrderId: order.client_order_id,
       symbol: opt.symbol, underlying: 'SPY', direction: signal.direction,
@@ -427,11 +430,22 @@ async function placeEntry(signal, signalId) {
       gexRegime: signal.meta.gexRegime, gexFlags: signal.meta.gexFlags,
       tp1Hit: false, status: 'OPEN', entryTime: new Date().toISOString(),
       unrealizedPnL: 0, pnlPct: 0, signalId,
+      // Running high/low watermark on the option premium while held —
+      // tracks the best and worst price seen so far, independent of where
+      // it currently sits. Updated every monitor poll (now every 1 minute).
+      maxPremium: limitPrice,
+      minPremium: limitPrice,
+      // Plain-English explanation of WHY this trade fired — zone + setup +
+      // every positive-weight confluence factor (GEX regime/flip/walls,
+      // VWAP, EMA, ATR, volume). Persisted to DB and shown in the dashboard
+      // so every entry is self-explanatory without reading the strategy code.
+      confluenceSummary,
     };
 
     state.positions[opt.symbol] = pos;
     DB.saveTradeEntry(pos, signalId);
     log(`ENTRY: ${signal.direction} ${contracts}x ${opt.symbol} @ $${limitPrice} | ${signal.grade} ${signal.confidence}% | Stop:$${premStop} TP1:$${tp1Price} TP2:$${tp2Price}`);
+    log(`  ↳ Confluence: ${confluenceSummary}`);
     return pos;
   } catch (e) {
     log(`createOrder: ${e.message}`, 'ERROR');
@@ -459,11 +473,13 @@ async function closePosition(symbol, reason, partial = false, partialPct = 1.0) 
     } catch (_) {}
 
     const pnl = (exitP - pos.entryPremium) * qty * 100;
-    DB.saveTradeExit(pos.clientOrderId, exitP, pos.entryPremium, reason, pos.entryTime, qty);
+    const exitStrategyLabel = getExitStrategyLabel(reason);
+    DB.saveTradeExit(pos.clientOrderId, exitP, pos.entryPremium, reason, pos.entryTime, qty, pos.maxPremium, pos.minPremium, exitStrategyLabel);
     updateStats(pnl, pos.setupType, pos.grade);
 
     const todayPnL = DB.getTodayPnL();
     log(`EXIT [${reason}]: ${qty}x ${symbol} @ ~$${exitP.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Daily: $${todayPnL.toFixed(2)}`);
+    log(`  ↳ Exit strategy: ${exitStrategyLabel}`);
 
     if (partial && qty < pos.contracts) {
       pos.contracts -= qty;
@@ -487,6 +503,12 @@ async function closePosition(symbol, reason, partial = false, partialPct = 1.0) 
 }
 
 // ─── POSITION MONITOR ─────────────────────────────────────────────────────────
+// FIX: position monitoring decoupled from the 5-min signal-scan cadence.
+// Runs on its own 1-minute interval (POSITION_POLL_SECS) so stops/TPs/exit
+// signals are checked far more often than new entries are evaluated.
+// bars5m is optional here — only needed for the Sowmya opposing-signal exit
+// check; when called from the dedicated 1-min poller (no fresh bars handy)
+// that check is simply skipped for that cycle and re-checked next poll.
 async function monitorPositions(bars5m) {
   for (const [symbol, pos] of Object.entries(state.positions)) {
     try {
@@ -498,6 +520,10 @@ async function monitorPositions(bars5m) {
           pos.unrealizedPnL  = (cur - pos.entryPremium) * pos.contracts * 100;
           pos.pnlPct         = ((cur - pos.entryPremium) / pos.entryPremium) * 100;
           pos.status         = 'OPEN';
+          // Running watermark — highest/lowest premium seen while held
+          pos.maxPremium = Math.max(pos.maxPremium ?? cur, cur);
+          pos.minPremium = Math.min(pos.minPremium ?? cur, cur);
+          DB.updateTradeWatermark(pos.clientOrderId, pos.maxPremium, pos.minPremium);
         }
       } catch (_) {}
 
@@ -575,7 +601,10 @@ async function runScan() {
       );
     }
 
-    // Monitor open positions
+    // Position monitoring now runs on its own dedicated 1-minute interval
+    // (see schedulePositionPoll below) — no longer tied to the 5-min scan.
+    // Still pass bars5m here too in case a position needs the Sowmya exit
+    // check immediately rather than waiting up to a minute for the next poll.
     await monitorPositions(bars5m);
 
     // News blackout
@@ -604,6 +633,9 @@ async function runScan() {
 
     const rejectStr = signal.rejectReasons.length ? ` REJECT: ${signal.rejectReasons[0]}` : '';
     log(`SCAN ${etStr} → ${signal.direction} ${signal.confidence}% ${signal.grade || '-'} setup=${signal.setup?.type || 'none'} zone=${signal.zoneHit?.type || 'miss'} multi=${state.gexAll.multiAligned}${rejectStr}`);
+    if (signal.meta?.confluenceSummary) {
+      log(`  ↳ Confluence: ${signal.meta.confluenceSummary}`);
+    }
 
     if (signal.tradeable) await placeEntry(signal, signalId);
 
@@ -633,6 +665,23 @@ function scheduleDailyReset() {
       fetchPriorDayClose('SPY');
     }
   }, 60000);
+}
+
+// Position monitoring on its own 1-minute cadence — independent of
+// SCAN_INTERVAL_MINS (5 min by default for new-signal evaluation). Stops,
+// TPs, and the Sowmya exit signal need much tighter polling than that, or a
+// position can blow through a stop and sit unclosed for up to 5 minutes.
+const POSITION_POLL_MS = 60 * 1000;
+function schedulePositionPoll() {
+  setInterval(async () => {
+    if (!isMarketHours()) return;
+    if (Object.keys(state.positions).length === 0) return;  // nothing to poll
+    try {
+      await monitorPositions(null);  // no fresh 5m bars on this cadence; stop/TP checks don't need them
+    } catch (e) {
+      log(`Position poll error: ${e.message}`, 'ERROR');
+    }
+  }, POSITION_POLL_MS);
 }
 
 function isMarketHours() {
@@ -755,6 +804,7 @@ app.listen(ENV.PORT, () => {
   log(`DSB v3 | port=${ENV.PORT} paper=${ENV.PAPER} autoTrade=${ENV.AUTO_TRADE} dbAvailable=${DB.isAvailable()}`);
   scheduleForceClose();
   scheduleDailyReset();
+  schedulePositionPoll();
 
   // Run startup data fetches async, AFTER the port is already listening.
   // Wrapped in its own try/catch so a slow/broken Alpaca connection at
