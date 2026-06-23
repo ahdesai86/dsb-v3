@@ -437,6 +437,21 @@ function calcGEXLevels(optionChain, spotPrice) {
   const strikes  = Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
   if (!strikes.length) return null;
 
+  // Guard: if every strike has net GEX of exactly 0 (e.g. open_interest was
+  // missing/zero for all contracts upstream), anchor/flip/walls become
+  // meaningless — anchor would just be strikes[0] by tie-break, not a real
+  // GEX magnet. Surface this explicitly rather than returning fake levels.
+  const nonZeroCount = strikes.filter(s => s.net !== 0).length;
+  if (nonZeroCount === 0) {
+    return {
+      totalGEX: 0, totalVEX: 0, isPositiveGEX: false, regime: 'UNKNOWN',
+      gexVexAgreement: false, concentration: 0,
+      anchor: null, flip: null, wallAbove: null, wallBelow: null,
+      walls: [], strikes, degenerate: true,
+      degenerateReason: 'all contracts had zero net GEX (likely missing open_interest or gamma upstream)',
+    };
+  }
+
   const totalGEX = strikes.reduce((s, x) => s + x.net, 0);
   const totalVEX = strikes.reduce((s, x) => s + x.vexNet, 0);
 

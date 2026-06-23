@@ -189,54 +189,96 @@ function getNextFriday() {
 // We also need open_interest — it comes from the raw data as 'open_interest' field
 // Use feed:'indicative' for greeks (more reliable than 'opra' for paper accounts)
 
+// FIX (root cause of flip=null + bogus anchor): the options SNAPSHOT endpoint
+// (getOptionChain → /v1beta1/options/snapshots/{symbol}) returns greeks but
+// per Alpaca's own docs it does NOT include open_interest at all. Open
+// interest only exists on the separate CONTRACTS metadata endpoint
+// (/v2/options/contracts), which has no SDK method in this package version.
+// We were reading c.open_interest off the snapshot response, which is always
+// undefined → defaulted to 0 → every gexContrib = gamma * 0 * 100 * spot = 0
+// for every single contract. That makes ALL GEX values zero: no sign changes
+// ever occur (flip stays null forever) and 'anchor' just becomes whichever
+// strike happens to be first when every |net| ties at 0 — explaining the
+// suspiciously low, static anchor values (425, 400, 2800) we saw in prod.
+//
+// Fix: fetch BOTH endpoints and merge by symbol —
+//   1) /v2/options/contracts  → open_interest, strike_price, type (ground truth)
+//   2) /v1beta1/options/snapshots/{symbol} → greeks (gamma, vanna)
+// via client.httpRequest() (trading API) and client.getOptionChain() (data API).
 async function fetchGEXForTicker(ticker) {
   const client = getAlpaca();
   if (!client) throw new Error('no client');
 
   const spot   = await getSpotPrice(ticker);
   const expiry = getNextFriday();
-
-  // getOptionChain(underlyingSymbol, options) — FIX 1
-  // For SPX we use SPXW (weekly options), for SPY/QQQ use the ticker directly
   const underlying = ticker === 'SPX' ? 'SPXW' : ticker;
 
+  // 1) Contracts metadata — ground truth for open_interest, strike, type
+  const contractsResp = await withRetry(
+    () => client.httpRequest('/options/contracts', {
+      underlying_symbols: underlying,
+      expiration_date:    expiry,
+      limit:              500,
+      status:             'active',
+    }),
+    `httpRequest(/options/contracts, ${underlying})`
+  );
+
+  const rawContracts = contractsResp?.data?.option_contracts || [];
+  if (rawContracts.length < 5) {
+    throw new Error(`insufficient contracts metadata: ${rawContracts.length}`);
+  }
+
+  // Build a lookup: symbol → { strike, type, open_interest }
+  const oiMap = new Map();
+  for (const c of rawContracts) {
+    oiMap.set(c.symbol, {
+      strike:        parseFloat(c.strike_price),
+      type:          c.type,                       // 'call' | 'put'
+      open_interest: parseInt(c.open_interest, 10) || 0,
+    });
+  }
+
+  // 2) Snapshots — greeks (gamma, vanna) per symbol
   const chainData = await withRetry(
     () => client.getOptionChain(underlying, {
       expiration_date: expiry,
-      feed:            'indicative',   // indicative feed gives greeks on paper accounts
-      totalLimit:      500,            // cap to avoid huge response
+      feed:            'indicative',
+      totalLimit:      500,
     }),
     `getOptionChain(${underlying})`
   );
 
   if (!chainData || chainData.length < 5) {
-    throw new Error(`insufficient chain: ${chainData?.length || 0} contracts`);
+    throw new Error(`insufficient chain snapshots: ${chainData?.length || 0}`);
   }
 
-  // Map to our internal format
-  // chainData[i] has: Symbol, Greeks.{delta,gamma,theta,vega,rho}, ImpliedVolatility,
-  //                   LatestQuote.{AskPrice,BidPrice}, open_interest (raw field)
-  const contracts = chainData.map(c => {
-    // Determine call/put from symbol (e.g. SPY250620C00590000 → 'C')
-    const sym  = c.Symbol || '';
-    const type = sym.includes('C') ? 'call' : 'put';
-    // Strike from symbol: last 8 digits / 1000
-    const strikeStr = sym.slice(-8);
-    const strike    = parseInt(strikeStr, 10) / 1000;
+  // Merge: walk the contracts metadata (ground truth) and attach greeks
+  // from the matching snapshot symbol, if present.
+  const snapBySymbol = new Map(chainData.map(s => [s.Symbol, s]));
 
-    return {
-      strike_price:  strike,
-      type,
-      open_interest: c.open_interest || 0,
+  const contracts = [];
+  for (const [symbol, meta] of oiMap.entries()) {
+    if (!meta.strike || meta.strike <= 0) continue;
+    const snap = snapBySymbol.get(symbol);
+    contracts.push({
+      strike_price:  meta.strike,
+      type:          meta.type,
+      open_interest: meta.open_interest,
       greeks: {
-        gamma: c.Greeks?.gamma || c.greeks?.gamma || 0,
-        vanna: c.Greeks?.vanna || c.greeks?.vanna || 0,
+        gamma: snap?.Greeks?.gamma || 0,
+        vanna: snap?.Greeks?.vanna || 0,
       },
-    };
-  }).filter(c => c.strike_price > 0);
+    });
+  }
 
   if (contracts.length < 5) {
-    throw new Error(`filtered to only ${contracts.length} valid contracts`);
+    throw new Error(`merged contract count too low: ${contracts.length}`);
+  }
+
+  const withOI = contracts.filter(c => c.open_interest > 0).length;
+  if (withOI === 0) {
+    throw new Error('all contracts have zero open_interest — GEX would be all-zero');
   }
 
   const gex = calcGEXLevels(contracts, spot);
@@ -258,7 +300,11 @@ async function refreshGEXAll() {
       const result = await fetchGEXForTicker(ticker);
       state.gexAll[ticker] = result.gex;
       DB.saveGEXSnap(ticker, result.gex, result.spot);
-      log(`GEX ${ticker}: anchor=${result.gex?.anchor} flip=${result.gex?.flip} regime=${result.gex?.regime} contracts=${result.gex?.strikes?.length || 0}`);
+      if (result.gex?.degenerate) {
+        log(`GEX ${ticker}: DEGENERATE — ${result.gex.degenerateReason}`, 'WARN');
+      } else {
+        log(`GEX ${ticker}: anchor=${result.gex?.anchor} flip=${result.gex?.flip} regime=${result.gex?.regime} contracts=${result.gex?.strikes?.length || 0}`);
+      }
     } catch (e) {
       log(`GEX ${ticker} failed: ${e.message}`, 'WARN');
       // Keep prior GEX data if refresh fails — don't null it out
