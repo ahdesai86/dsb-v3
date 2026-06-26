@@ -306,7 +306,7 @@ async function fetchGEXForTicker(ticker) {
   const withOI = contracts.filter(c => c.open_interest > 0).length;
   const withGamma = contracts.filter(c => c.greeks.gamma !== 0).length;
   const sampleSnap = chainData[0];
-  log(`GEX ${ticker}: ${contracts.length} merged, ${withOI} w/OI, ${withGamma} w/gamma, expiry=${expiry}, snap keys=${sampleSnap ? Object.keys(sampleSnap).join(',') : 'none'}, greeks keys=${sampleSnap?.Greeks ? Object.keys(sampleSnap.Greeks).join(',') : (sampleSnap?.greeks ? 'lowercase:' + Object.keys(sampleSnap.greeks).join(',') : 'none')}`);
+  log(`GEX ${ticker}: ${contracts.length} merged, ${withOI} w/OI, ${withGamma} w/gamma, expiry=${expiry}, snap sample=${JSON.stringify(Object.keys(sampleSnap||{}))}, IV=${sampleSnap?.ImpliedVolatility ?? sampleSnap?.impliedVolatility ?? 'none'}`);
   if (withOI === 0) {
     throw new Error('all contracts have zero open_interest — GEX would be all-zero');
   }
@@ -655,7 +655,7 @@ async function runScan() {
       etHour:        etH,
       etMinute:      etM,
       priorDayClose: state.priorDayClose,
-      minConfidence: cfg.MIN_CONFIDENCE,
+      minConfidence: state.config.MIN_CONFIDENCE,
     });
     state.lastSignal = signal;
 
