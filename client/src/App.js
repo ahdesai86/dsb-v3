@@ -537,8 +537,7 @@ export default function App() {
     } catch(_){}
   },[]);
 
-  const pollMs = posCount > 0 ? 3000 : 7000;
-  useEffect(()=>{ refresh(); const t=setInterval(refresh,pollMs); return ()=>clearInterval(t); },[refresh,pollMs]);
+  useEffect(()=>{ refresh(); const t=setInterval(refresh,7000); return ()=>clearInterval(t); },[refresh]);
   useEffect(()=>{ if(tab==='analytics'){ loadAnalytics(); const t=setInterval(loadAnalytics,30000); return ()=>clearInterval(t); } },[tab,loadAnalytics]);
 
   const close=async sym=>{if(!window.confirm(`Close ${sym.slice(-14)}?`))return;await api.post(`/api/close/${encodeURIComponent(sym)}`);refresh();};
@@ -553,6 +552,10 @@ export default function App() {
   const cb=data?.cbTriggered;
   const dailyPnL=data?.dailyPnL||0;
   const gexAll=data?.gexAll;
+
+  // Faster polling when positions are open
+  const pollMs = posCount > 0 ? 3000 : 7000;
+  useEffect(()=>{ const t=setInterval(refresh,pollMs); return ()=>clearInterval(t); },[refresh,pollMs]);
 
   const TABS=[['dashboard','Dashboard'],['analytics','Analytics'],['config','Config']];
 
