@@ -110,6 +110,45 @@ function log(msg, level = 'INFO') {
 // ─── SLEEP HELPER ─────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ─── BLACK-SCHOLES GAMMA (fallback when API doesn't provide greeks) ──────────
+function bsGamma(spot, strike, tte, iv) {
+  if (!iv || iv <= 0 || tte <= 0) return 0;
+  const sqrtT = Math.sqrt(tte);
+  const d1 = (Math.log(spot / strike) + (0.5 * iv * iv) * tte) / (iv * sqrtT);
+  const pdf = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI);
+  return pdf / (spot * iv * sqrtT);
+}
+
+function bsPrice(spot, strike, tte, iv, isCall) {
+  if (tte <= 0 || iv <= 0) return Math.max(0, isCall ? spot - strike : strike - spot);
+  const sqrtT = Math.sqrt(tte);
+  const d1 = (Math.log(spot / strike) + 0.5 * iv * iv * tte) / (iv * sqrtT);
+  const d2 = d1 - iv * sqrtT;
+  const Nd1 = 0.5 * (1 + erf(d1 / Math.SQRT2));
+  const Nd2 = 0.5 * (1 + erf(d2 / Math.SQRT2));
+  if (isCall) return spot * Nd1 - strike * Nd2;
+  return strike * (1 - Nd2) - spot * (1 - Nd1);
+}
+
+function erf(x) {
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const t = 1 / (1 + p * x);
+  return sign * (1 - (((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t * Math.exp(-x*x));
+}
+
+function impliedVol(spot, strike, tte, marketPrice, isCall) {
+  let lo = 0.01, hi = 5.0;
+  for (let i = 0; i < 50; i++) {
+    const mid = (lo + hi) / 2;
+    const p = bsPrice(spot, strike, tte, mid, isCall);
+    if (p > marketPrice) hi = mid; else lo = mid;
+    if (hi - lo < 0.001) break;
+  }
+  return (lo + hi) / 2;
+}
+
 // ─── RETRY WRAPPER ────────────────────────────────────────────────────────────
 // Handles 429 rate limit with exponential backoff
 async function withRetry(fn, label, retries = 3, baseDelayMs = 2000) {
@@ -281,21 +320,38 @@ async function fetchGEXForTicker(ticker) {
   // Merge: walk the contracts metadata (ground truth) and attach greeks
   // from the matching snapshot symbol, if present.
   // Support both SDK casing: Greeks.gamma (v3) or greeks.gamma
+  // Fallback: compute gamma via Black-Scholes from bid/ask mid price
   const snapBySymbol = new Map(chainData.map(s => [s.Symbol || s.symbol, s]));
+
+  const now = new Date();
+  const expiryDate = new Date(expiry + 'T16:00:00-04:00');
+  const tte = Math.max((expiryDate - now) / (365.25 * 24 * 3600 * 1000), 1 / (365.25 * 24));
 
   const contracts = [];
   for (const [symbol, meta] of oiMap.entries()) {
     if (!meta.strike || meta.strike <= 0) continue;
     const snap = snapBySymbol.get(symbol);
     const g = snap?.Greeks || snap?.greeks || {};
+    let gamma = g.gamma || g.Gamma || 0;
+    let vanna = g.vanna || g.Vanna || 0;
+
+    if (gamma === 0 && snap) {
+      const q = snap.LatestQuote || snap.latestQuote || {};
+      const bid = q.BidPrice || q.bp || q.bid_price || 0;
+      const ask = q.AskPrice || q.ap || q.ask_price || 0;
+      const mid = (bid + ask) / 2;
+      if (mid > 0.01 && spot > 0) {
+        const isCall = meta.type === 'call';
+        const iv = impliedVol(spot, meta.strike, tte, mid, isCall);
+        gamma = bsGamma(spot, meta.strike, tte, iv);
+      }
+    }
+
     contracts.push({
       strike_price:  meta.strike,
       type:          meta.type,
       open_interest: meta.open_interest,
-      greeks: {
-        gamma: g.gamma || g.Gamma || 0,
-        vanna: g.vanna || g.Vanna || 0,
-      },
+      greeks: { gamma, vanna },
     });
   }
 
