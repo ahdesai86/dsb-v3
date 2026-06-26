@@ -251,14 +251,28 @@ async function fetchGEXForTicker(ticker) {
   }
 
   // 2) Snapshots — greeks (gamma, vanna) per symbol
-  const chainData = await withRetry(
-    () => client.getOptionChain(underlying, {
-      expiration_date: expiry,
-      feed:            'indicative',
-      totalLimit:      500,
-    }),
-    `getOptionChain(${underlying})`
-  );
+  // Try 'opra' feed first (has greeks), fall back to 'indicative'
+  let chainData;
+  for (const feed of ['opra', 'indicative']) {
+    try {
+      chainData = await withRetry(
+        () => client.getOptionChain(underlying, {
+          expiration_date: expiry,
+          feed,
+          totalLimit:      500,
+        }),
+        `getOptionChain(${underlying}, feed=${feed})`
+      );
+      if (chainData && chainData.length >= 5) {
+        const sample = chainData[0];
+        const hasGreeks = !!(sample?.Greeks || sample?.greeks || sample?.ImpliedVolatility);
+        log(`GEX ${ticker}: feed=${feed} returned ${chainData.length} snaps, hasGreeks=${hasGreeks}`);
+        if (hasGreeks) break;
+      }
+    } catch (e) {
+      log(`GEX ${ticker}: feed=${feed} failed: ${e.message}`, 'WARN');
+    }
+  }
 
   if (!chainData || chainData.length < 5) {
     throw new Error(`insufficient chain snapshots: ${chainData?.length || 0}`);
@@ -266,19 +280,21 @@ async function fetchGEXForTicker(ticker) {
 
   // Merge: walk the contracts metadata (ground truth) and attach greeks
   // from the matching snapshot symbol, if present.
-  const snapBySymbol = new Map(chainData.map(s => [s.Symbol, s]));
+  // Support both SDK casing: Greeks.gamma (v3) or greeks.gamma
+  const snapBySymbol = new Map(chainData.map(s => [s.Symbol || s.symbol, s]));
 
   const contracts = [];
   for (const [symbol, meta] of oiMap.entries()) {
     if (!meta.strike || meta.strike <= 0) continue;
     const snap = snapBySymbol.get(symbol);
+    const g = snap?.Greeks || snap?.greeks || {};
     contracts.push({
       strike_price:  meta.strike,
       type:          meta.type,
       open_interest: meta.open_interest,
       greeks: {
-        gamma: snap?.Greeks?.gamma || 0,
-        vanna: snap?.Greeks?.vanna || 0,
+        gamma: g.gamma || g.Gamma || 0,
+        vanna: g.vanna || g.Vanna || 0,
       },
     });
   }
