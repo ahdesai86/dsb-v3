@@ -764,7 +764,7 @@ function getExitStrategyLabel(reasonCode) {
 //   Max:          ~100
 //
 // TRADEABLE THRESHOLD: confidence >= MIN_CONFIDENCE (default 65%)
-function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayClose }) {
+function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayClose, minConfidence = 65 }) {
   const result = {
     direction:     'NEUTRAL',
     confidence:    0,
@@ -883,7 +883,7 @@ function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayCl
     zoneHit.hit   &&
     setup !== null &&
     !result.exitSignal?.exit &&            // don't enter if exit signal is firing
-    result.confidence >= 65               // configurable
+    result.confidence >= minConfidence
   );
 
   if (!zoneHit.hit)         result.rejectReasons.push('Zone miss — no S&D zone present');

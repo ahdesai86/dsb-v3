@@ -177,9 +177,19 @@ async function getSpotPrice(ticker) {
 }
 
 // ─── OPTION EXPIRY ────────────────────────────────────────────────────────────
-function getNextFriday() {
+function get0DTEExpiry(ticker) {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  while (d.getDay() !== 5) d.setDate(d.getDate() + 1);
+  const day = d.getDay(); // 0=Sun..6=Sat
+
+  if (ticker === 'SPX' || ticker === 'SPXW') {
+    // SPXW has 0DTE every weekday
+    if (day === 0) d.setDate(d.getDate() + 1);
+    else if (day === 6) d.setDate(d.getDate() + 2);
+  } else {
+    // SPY/QQQ: 0DTE on Mon(1), Wed(3), Fri(5)
+    const valid = [1, 3, 5];
+    while (!valid.includes(d.getDay())) d.setDate(d.getDate() + 1);
+  }
   return d.toISOString().split('T')[0];
 }
 
@@ -211,7 +221,7 @@ async function fetchGEXForTicker(ticker) {
   if (!client) throw new Error('no client');
 
   const spot   = await getSpotPrice(ticker);
-  const expiry = getNextFriday();
+  const expiry = get0DTEExpiry(ticker);
   const underlying = ticker === 'SPX' ? 'SPXW' : ticker;
 
   // 1) Contracts metadata — ground truth for open_interest, strike, type
@@ -315,8 +325,9 @@ async function refreshGEXAll() {
   }
 
   // Multi-ticker alignment (video 2: step 6)
+  // Require at least 2 tickers with matching regime (SPX may fail on some days)
   const regimes = tickers.map(t => state.gexAll[t]?.regime).filter(Boolean);
-  state.gexAll.multiAligned = regimes.length === 3 && new Set(regimes).size === 1;
+  state.gexAll.multiAligned = regimes.length >= 2 && new Set(regimes).size === 1;
   state.gexAll.lastFetch    = new Date().toISOString();
 
   log(`GEX complete — SPY:${state.gexAll.SPY?.regime || '?'} QQQ:${state.gexAll.QQQ?.regime || '?'} SPX:${state.gexAll.SPX?.regime || '?'} aligned:${state.gexAll.multiAligned}`);
@@ -346,7 +357,7 @@ async function findOption(symbol, direction) {
   if (!client) return null;
   try {
     const spot   = await getSpotPrice(symbol);
-    const expiry = getNextFriday();
+    const expiry = get0DTEExpiry(symbol);
     const strike = Math.round(spot);
     const expStr = expiry.replace(/-/g, '').slice(2);  // YYMMDD
     const strStr = (strike * 1000).toString().padStart(8, '0');
@@ -432,7 +443,7 @@ async function placeEntry(signal, signalId) {
       unrealizedPnL: 0, pnlPct: 0, signalId,
       // Running high/low watermark on the option premium while held —
       // tracks the best and worst price seen so far, independent of where
-      // it currently sits. Updated every monitor poll (now every 1 minute).
+      // it currently sits. Updated every monitor poll (every 30 seconds).
       maxPremium: limitPrice,
       minPremium: limitPrice,
       // Plain-English explanation of WHY this trade fired — zone + setup +
@@ -625,6 +636,7 @@ async function runScan() {
       etHour:        etH,
       etMinute:      etM,
       priorDayClose: state.priorDayClose,
+      minConfidence: cfg.MIN_CONFIDENCE,
     });
     state.lastSignal = signal;
 
@@ -667,11 +679,11 @@ function scheduleDailyReset() {
   }, 60000);
 }
 
-// Position monitoring on its own 1-minute cadence — independent of
+// Position monitoring on its own 30-second cadence — independent of
 // SCAN_INTERVAL_MINS (5 min by default for new-signal evaluation). Stops,
 // TPs, and the Sowmya exit signal need much tighter polling than that, or a
-// position can blow through a stop and sit unclosed for up to 5 minutes.
-const POSITION_POLL_MS = 60 * 1000;
+// position can blow through a stop and sit unclosed for minutes.
+const POSITION_POLL_MS = 30 * 1000;
 function schedulePositionPoll() {
   setInterval(async () => {
     if (!isMarketHours()) return;
