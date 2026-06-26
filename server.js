@@ -37,6 +37,7 @@ const {
   getExitStrategyLabel,
 } = require('./strategy');
 const DB = require('./db');
+const FlashAlpha = require('./flashalpha');
 
 const app = express();
 app.use(express.json());
@@ -379,33 +380,56 @@ let lastGEXMinute = '';
 
 async function refreshGEXAll() {
   const tickers = ['SPY', 'QQQ', 'SPX'];
-  log(`Refreshing GEX for ${tickers.join(', ')}...`);
+  const useFlashAlpha = FlashAlpha.isAvailable();
+  log(`Refreshing GEX for ${tickers.join(', ')}... source=${useFlashAlpha ? 'FlashAlpha→Alpaca' : 'Alpaca only'}`);
 
   for (const ticker of tickers) {
-    try {
-      const result = await fetchGEXForTicker(ticker);
+    let result = null;
+
+    // Try FlashAlpha first (production-grade GEX with accurate gamma_flip/walls)
+    if (useFlashAlpha) {
+      try {
+        const expiry = get0DTEExpiry(ticker);
+        const faResult = await FlashAlpha.fetchGEXForTicker(ticker, expiry);
+        if (faResult && faResult.gex && !faResult.gex.degenerate) {
+          result = faResult;
+          log(`GEX ${ticker} [FlashAlpha]: flip=${result.gex.flip} regime=${result.gex.regime} callWall=${result.gex.callWall} putWall=${result.gex.putWall} magnet=${result.gex.zeroDteMagnet}`);
+        }
+      } catch (e) {
+        log(`GEX ${ticker} FlashAlpha failed: ${e.message}`, 'WARN');
+      }
+    }
+
+    // Fall back to Alpaca self-calc
+    if (!result) {
+      try {
+        result = await fetchGEXForTicker(ticker);
+        if (result?.gex) result.gex.source = 'alpaca';
+        if (result?.gex?.degenerate) {
+          log(`GEX ${ticker} [Alpaca]: DEGENERATE — ${result.gex.degenerateReason}`, 'WARN');
+        } else {
+          log(`GEX ${ticker} [Alpaca]: anchor=${result?.gex?.anchor} flip=${result?.gex?.flip} regime=${result?.gex?.regime}`);
+        }
+      } catch (e) {
+        log(`GEX ${ticker} Alpaca failed: ${e.message}`, 'WARN');
+      }
+    }
+
+    if (result?.gex) {
       state.gexAll[ticker] = result.gex;
       DB.saveGEXSnap(ticker, result.gex, result.spot);
-      if (result.gex?.degenerate) {
-        log(`GEX ${ticker}: DEGENERATE — ${result.gex.degenerateReason}`, 'WARN');
-      } else {
-        log(`GEX ${ticker}: anchor=${result.gex?.anchor} flip=${result.gex?.flip} regime=${result.gex?.regime} contracts=${result.gex?.strikes?.length || 0}`);
-      }
-    } catch (e) {
-      log(`GEX ${ticker} failed: ${e.message}`, 'WARN');
-      // Keep prior GEX data if refresh fails — don't null it out
     }
-    // Stagger: wait 1.5s between tickers to avoid rate limits
+
     await sleep(1500);
   }
 
   // Multi-ticker alignment (video 2: step 6)
-  // Require at least 2 tickers with matching regime (SPX may fail on some days)
   const regimes = tickers.map(t => state.gexAll[t]?.regime).filter(Boolean);
   state.gexAll.multiAligned = regimes.length >= 2 && new Set(regimes).size === 1;
   state.gexAll.lastFetch    = new Date().toISOString();
+  state.gexAll.source       = useFlashAlpha ? 'flashalpha' : 'alpaca';
 
-  log(`GEX complete — SPY:${state.gexAll.SPY?.regime || '?'} QQQ:${state.gexAll.QQQ?.regime || '?'} SPX:${state.gexAll.SPX?.regime || '?'} aligned:${state.gexAll.multiAligned}`);
+  log(`GEX complete — SPY:${state.gexAll.SPY?.regime || '?'} QQQ:${state.gexAll.QQQ?.regime || '?'} SPX:${state.gexAll.SPX?.regime || '?'} aligned:${state.gexAll.multiAligned} source=${state.gexAll.source}`);
 }
 
 // ─── OPTION QUOTE — CORRECT METHOD ────────────────────────────────────────────
@@ -490,9 +514,30 @@ async function placeEntry(signal, signalId) {
   const limitPrice = parseFloat((premium * 1.01).toFixed(2));
   const premStop   = parseFloat((limitPrice * (1 - cfg.PREMIUM_STOP_PCT)).toFixed(2));
   const atrStop    = parseFloat((limitPrice - (signal.meta.atr || limitPrice * 0.1) * cfg.ATR_STOP_MULT).toFixed(2));
-  const tp1Price   = parseFloat((limitPrice * (1 + cfg.TP1_PCT)).toFixed(2));
-  const tp2Price   = parseFloat((limitPrice * (1 + cfg.TP2_PCT)).toFixed(2));
-  const gexTP1     = signal.direction === 'CALL' ? state.gexAll.SPY?.wallAbove : state.gexAll.SPY?.wallBelow;
+
+  // Dynamic TP: use FlashAlpha wall levels when available
+  // Wall-based TP estimates premium gain from underlying moving to the wall
+  // using a rough delta approximation (ATM 0DTE delta ~0.50)
+  const gexData = state.gexAll.SPY;
+  const targetWall = signal.direction === 'CALL' ? gexData?.callWall || gexData?.wallAbove : gexData?.putWall || gexData?.wallBelow;
+  let tp1Price, tp2Price;
+  if (targetWall && opt.spot) {
+    const underlyingMove = Math.abs(targetWall - opt.spot);
+    const estDelta = 0.45;
+    const wallPremiumGain = underlyingMove * estDelta;
+    // TP1 = 60% of move to wall, TP2 = full wall
+    tp1Price = parseFloat((limitPrice + wallPremiumGain * 0.6).toFixed(2));
+    tp2Price = parseFloat((limitPrice + wallPremiumGain).toFixed(2));
+    // Floor: never below the fixed % targets
+    tp1Price = Math.max(tp1Price, parseFloat((limitPrice * (1 + cfg.TP1_PCT)).toFixed(2)));
+    tp2Price = Math.max(tp2Price, parseFloat((limitPrice * (1 + cfg.TP2_PCT)).toFixed(2)));
+    log(`  ↳ Wall-based TP: wall=${targetWall} move=$${underlyingMove.toFixed(2)} → TP1=$${tp1Price} TP2=$${tp2Price}`);
+  } else {
+    tp1Price = parseFloat((limitPrice * (1 + cfg.TP1_PCT)).toFixed(2));
+    tp2Price = parseFloat((limitPrice * (1 + cfg.TP2_PCT)).toFixed(2));
+  }
+  const gexTP1 = targetWall || null;
+  const zeroDteMagnet = gexData?.zeroDteMagnet || null;
 
   try {
     const order = await client.createOrder({
@@ -508,7 +553,7 @@ async function placeEntry(signal, signalId) {
       symbol: opt.symbol, underlying: 'SPY', direction: signal.direction,
       contracts, entryPremium: limitPrice, currentPrice: limitPrice,
       strike: opt.strike, expiry: opt.expiry, spot: opt.spot,
-      atr: signal.meta.atr, stopPrice: premStop, atrStop, tp1Price, tp2Price, gexTP1,
+      atr: signal.meta.atr, stopPrice: premStop, atrStop, tp1Price, tp2Price, gexTP1, zeroDteMagnet,
       setupType: signal.setup?.type, grade: signal.grade, confidence: signal.confidence,
       setupDesc: signal.setup?.desc, delta: signal.meta.delta,
       deltaMag: signal.meta.deltaMag, hasBShape: signal.meta.hasBShape,
@@ -633,6 +678,22 @@ async function monitorPositions(bars5m) {
       // 5. TP2 full close
       if (pos.tp1Hit && cur >= pos.tp2Price) {
         await closePosition(symbol, 'TP2'); continue;
+      }
+      // 6. 0DTE magnet pin exit — in the last 90 min, if price reached the
+      // magnet strike and we're in profit, take it. Price pins near the magnet
+      // into close, so further upside is unlikely and theta accelerates.
+      if (pos.zeroDteMagnet && pos.pnlPct > 5) {
+        const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const mins = et.getHours() * 60 + et.getMinutes();
+        if (mins >= 14 * 60 + 30) { // after 2:30 PM ET
+          try {
+            const spotNow = await getSpotPrice('SPY');
+            const distToMagnet = Math.abs(spotNow - pos.zeroDteMagnet) / spotNow;
+            if (distToMagnet < 0.002) { // within 0.2% of magnet
+              await closePosition(symbol, 'MAGNET_PIN'); continue;
+            }
+          } catch (_) {}
+        }
       }
     } catch (e) {
       log(`Monitor ${symbol}: ${e.message}`, 'ERROR');

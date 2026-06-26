@@ -603,6 +603,30 @@ function scoreGEXConfluence(gex, price, direction) {
     }
   }
 
+  // ── FlashAlpha-enhanced signals ──────────────────────────────────────────
+  // 0DTE magnet: price gravitates toward this strike into close.
+  // Trading toward the magnet is high-probability.
+  if (gex.zeroDteMagnet) {
+    const towardMagnet = direction === 'CALL' ? price < gex.zeroDteMagnet : price > gex.zeroDteMagnet;
+    if (towardMagnet) {
+      const dist = Math.abs(gex.zeroDteMagnet - price) / price;
+      if (dist > 0.001 && dist < 0.015) {
+        score += 12;
+        details.push({ label: `Toward 0DTE Magnet ${gex.zeroDteMagnet} (pin pull)`, color: 'green', weight: 12 });
+      }
+    } else {
+      score -= 5;
+      flags.push('AGAINST_MAGNET');
+      details.push({ label: `Against 0DTE Magnet ${gex.zeroDteMagnet}`, color: 'orange', weight: -5 });
+    }
+  }
+
+  // FlashAlpha source bonus: data is production-grade vs our approximation
+  if (gex.source === 'flashalpha') {
+    score += 5;
+    details.push({ label: 'FlashAlpha verified levels', color: 'green', weight: 5 });
+  }
+
   return { score: Math.max(0, Math.min(score, 100)), details, flags, regime: gex.regime };
 }
 
@@ -745,6 +769,7 @@ const EXIT_STRATEGY_LABELS = {
   TP1:             'Take-profit 1 — partial close at first target, stop trailed to breakeven',
   TP2:             'Take-profit 2 — full close at second target',
   FORCE_CLOSE_EOD: 'End-of-day force close — held past the configured force-close time',
+  MAGNET_PIN:      '0DTE magnet pin exit — underlying reached the FlashAlpha zero-DTE magnet strike in profit late in session',
   MANUAL:          'Manually closed from the dashboard',
 };
 

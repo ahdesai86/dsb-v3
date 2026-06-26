@@ -97,12 +97,13 @@ function GEXPanel({gexAll, onRefresh}) {
                 <span style={{fontSize:14,fontWeight:800,color:C.accent}}>{t}</span>
                 <Pill color={rC} sm>{g.regime}</Pill>
               </div>
-              {[['Anchor',g.anchor,C.accent],['Flip',g.flip,C.yellow],['Wall↑',g.wallAbove,C.red],['Wall↓',g.wallBelow,C.green]].map(([l,v,c])=>(
+              {[['Anchor',g.anchor,C.accent],['Flip',g.flip,C.yellow],['Call Wall',g.callWall||g.wallAbove,C.red],['Put Wall',g.putWall||g.wallBelow,C.green],['0DTE Magnet',g.zeroDteMagnet,C.purple]].filter(([,,v])=>v!==undefined).map(([l,v,c])=>(
                 <div key={l} style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:3}}>
                   <span style={{color:C.dim}}>{l}</span>
                   <span style={{color:c,fontWeight:700}}>{v?`$${v}`:' —'}</span>
                 </div>
               ))}
+              {g.source==='flashalpha'&&<Pill color={C.purple} sm>FlashAlpha</Pill>}
               {g.gexVexAgreement===false&&<div style={{fontSize:10,color:C.orange,marginTop:4}}>⚠ GEX/VEX disagree</div>}
             </div>
           );
@@ -574,6 +575,7 @@ export default function App() {
           {data?.config?.PAPER!==false&&<Pill color={C.purple}>PAPER</Pill>}
           {posCount>0&&<Pill color={C.accent}>{posCount} OPEN</Pill>}
           {gexAll?.multiAligned&&<Pill color={C.green}>3-TICKER ALIGNED</Pill>}
+          {gexAll?.source==='flashalpha'&&<Pill color={C.purple}>FlashAlpha</Pill>}
         </div>
         {data&&<div style={{marginLeft:'auto',textAlign:'right'}}>
           <div style={{fontSize:9,color:C.dim,textTransform:'uppercase',letterSpacing:1}}>Daily P/L</div>
