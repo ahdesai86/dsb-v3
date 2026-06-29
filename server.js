@@ -910,6 +910,47 @@ app.get('/api/mining/trades', (req, res) => {
   res.json(DB.db.prepare(q).all(...p));
 });
 
+// ─── BACKTEST ─────────────────────────────────────────────────────────────────
+const { runBacktest, generateReport } = require('./backtest');
+
+app.get('/api/backtest', async (req, res) => {
+  try {
+    const opts = {
+      days:           parseInt(req.query.days) || 20,
+      minConfidence:  parseInt(req.query.minConfidence) || 55,
+      premiumStopPct: parseFloat(req.query.premiumStopPct) || 0.45,
+      tp1Pct:         parseFloat(req.query.tp1Pct) || 0.50,
+      tp2Pct:         parseFloat(req.query.tp2Pct) || 1.00,
+      riskDollars:    parseInt(req.query.riskDollars) || 300,
+    };
+    log(`Backtest started: ${JSON.stringify(opts)}`);
+    const results = await runBacktest(opts);
+    log(`Backtest done: ${results.summary.totalTrades} trades, P/L: $${results.summary.totalPnl.toFixed(0)}, WR: ${results.summary.winRate}%`);
+    res.json(results);
+  } catch (e) {
+    log(`Backtest error: ${e.message}`, 'ERROR');
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/backtest/report', async (req, res) => {
+  try {
+    const opts = {
+      days:           parseInt(req.query.days) || 20,
+      minConfidence:  parseInt(req.query.minConfidence) || 55,
+      premiumStopPct: parseFloat(req.query.premiumStopPct) || 0.45,
+      tp1Pct:         parseFloat(req.query.tp1Pct) || 0.50,
+      tp2Pct:         parseFloat(req.query.tp2Pct) || 1.00,
+      riskDollars:    parseInt(req.query.riskDollars) || 300,
+    };
+    const results = await runBacktest(opts);
+    const html = generateReport(results);
+    res.type('html').send(html);
+  } catch (e) {
+    res.status(500).send(`<h1>Backtest Error</h1><pre>${e.message}</pre>`);
+  }
+});
+
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 // MUST be registered BEFORE the catch-all '*' route below — Express matches
 // routes in registration order, and a wildcard route placed first will
