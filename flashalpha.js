@@ -104,20 +104,35 @@ function setCache(key, data) {
 }
 
 // ─── KEY LEVELS (Free tier) ──────────────────────────────────────────────────
-// Returns: gamma_flip, call_wall, put_wall, max_positive_gamma,
-//          max_negative_gamma, highest_oi_strike, zero_dte_magnet
+// Real response shape (confirmed via raw-payload capture in production —
+// differs from the documented flat schema): the level fields are nested
+// under a `levels` key, with `symbol`/`underlying_price`/`as_of` at the top:
+//   { symbol, underlying_price, as_of, levels: { gamma_flip, call_wall,
+//     put_wall, max_positive_gamma, max_negative_gamma, highest_oi_strike,
+//     zero_dte_magnet } }
+// Normalize to a flat object so the rest of this module doesn't need to know
+// about the envelope.
 async function getLevels(symbol) {
   const cacheKey = `levels:${symbol}`;
   const cached = getCached(cacheKey);
   if (cached) { log(`levels ${symbol}: cache hit`); return cached; }
 
-  const data = await httpGet(`/v1/exposure/levels/${symbol}`);
+  const raw = await httpGet(`/v1/exposure/levels/${symbol}`);
+  const inner = raw.levels || raw; // unwrap envelope if present, else assume already flat
+  const data = {
+    symbol:             raw.symbol || symbol,
+    underlying_price:   raw.underlying_price ?? null,
+    gamma_flip:         inner.gamma_flip ?? null,
+    call_wall:          inner.call_wall ?? null,
+    put_wall:           inner.put_wall ?? null,
+    max_positive_gamma: inner.max_positive_gamma ?? null,
+    max_negative_gamma: inner.max_negative_gamma ?? null,
+    highest_oi_strike:  inner.highest_oi_strike ?? null,
+    zero_dte_magnet:    inner.zero_dte_magnet ?? null,
+  };
   setCache(cacheKey, data);
   if (data.gamma_flip == null) {
-    // Unexpected shape — dump top-level keys (and one level deep if nested)
-    // so we can see how the real payload differs from the documented schema
-    // instead of guessing blind.
-    log(`levels ${symbol}: unexpected shape, keys=[${Object.keys(data).join(',')}] raw=${JSON.stringify(data).slice(0, 400)}`, 'WARN');
+    log(`levels ${symbol}: unexpected shape, keys=[${Object.keys(raw).join(',')}] raw=${JSON.stringify(raw).slice(0, 400)}`, 'WARN');
   } else {
     log(`levels ${symbol}: flip=${data.gamma_flip} callWall=${data.call_wall} putWall=${data.put_wall} magnet=${data.zero_dte_magnet}`);
   }
@@ -235,7 +250,7 @@ async function fetchGEXForTicker(ticker, expiration, knownSpot) {
     gexData = await getGEX(ticker, expiration).catch(() => null);
   }
 
-  const spot = gexData?.underlying_price || knownSpot || null;
+  const spot = gexData?.underlying_price || levels.underlying_price || knownSpot || null;
   const gex = levelsToGEXFormat(levels, gexData, spot);
   return { gex, spot, levels };
 }
