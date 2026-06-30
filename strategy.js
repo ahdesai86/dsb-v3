@@ -904,15 +904,20 @@ function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayCl
   };
 
   // ── Tradeable threshold ───────────────────────────────────────────────────
+  // NOTE: exitSignal is intentionally NOT part of this gate. detectExitSignal()
+  // is evaluated against the same last candle that produced `setup` — for the
+  // B-grade variant of SETUP_3/SETUP_4 (B/P-shape without confirming delta),
+  // the opposing-pattern check can trigger on that very same candle, which
+  // would self-block a brand-new entry signal before any position even exists.
+  // The Sowmya opposing-signal exit rule is correctly applied only against
+  // OPEN positions (see monitorPositions() in server.js), not at entry time.
   result.tradeable = (
     zoneHit.hit   &&
     setup !== null &&
-    !result.exitSignal?.exit &&            // don't enter if exit signal is firing
     result.confidence >= minConfidence
   );
 
-  if (!zoneHit.hit)         result.rejectReasons.push('Zone miss — no S&D zone present');
-  if (result.exitSignal?.exit) result.rejectReasons.push(`Exit signal active: ${result.exitSignal.reason}`);
+  if (!zoneHit.hit) result.rejectReasons.push('Zone miss — no S&D zone present');
 
   return result;
 }

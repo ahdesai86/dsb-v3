@@ -11,18 +11,62 @@ const https = require('https');
 
 const BASE_URL = 'https://lab.flashalpha.com';
 const API_KEY = process.env.FLASHALPHA_API_KEY || '';
+// Free tier = 5 req/day. Set FLASHALPHA_DAILY_LIMIT env var higher if on a paid tier.
+const DAILY_LIMIT = parseInt(process.env.FLASHALPHA_DAILY_LIMIT, 10) || 5;
 
 const cache = {};
 const DEFAULT_CACHE_TTL_MS = 25 * 60 * 1000; // 25 min (inside a 30-min GEX refresh cycle)
 
+// ─── DAILY CALL BUDGET ────────────────────────────────────────────────────────
+// Free tier allows only 5 req/day total. Without a local guard, every refresh
+// cycle (every ~30 min during market hours) keeps hitting the API and burning
+// through 429s for the rest of the day after the budget is gone — wasted
+// latency and noisy logs. Track usage locally and short-circuit once the
+// budget is spent, so callers fall back to Alpaca immediately instead of
+// waiting on a doomed HTTP round-trip.
+let callCount = 0;
+let budgetResetDay = null;
+let budgetWarned = false;
+
+function currentETDay() {
+  return new Date().toLocaleString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
+}
+
+function checkBudget() {
+  const today = currentETDay();
+  if (budgetResetDay !== today) {
+    budgetResetDay = today;
+    callCount = 0;
+    budgetWarned = false;
+  }
+  if (callCount >= DAILY_LIMIT) {
+    if (!budgetWarned) {
+      log(`Daily call budget (${DAILY_LIMIT}) reached — falling back to Alpaca for the rest of ${today} ET. Set FLASHALPHA_DAILY_LIMIT or upgrade tier to raise this.`, 'WARN');
+      budgetWarned = true;
+    }
+    return false;
+  }
+  return true;
+}
+
+// External logger hook — server.js calls setExternalLogger(log) at startup so
+// FlashAlpha activity (especially failures) shows up in the dashboard's
+// /api/logs feed instead of only the raw Railway console, which nobody but
+// this process can see in real time.
+let externalLogger = null;
+function setExternalLogger(fn) { externalLogger = fn; }
+
 function log(msg, level = 'INFO') {
   const ts = new Date().toISOString();
   console.log(`[${ts}] [${level}] [FlashAlpha] ${msg}`);
+  if (externalLogger) externalLogger(`[FlashAlpha] ${msg}`, level);
 }
 
 function httpGet(path) {
   return new Promise((resolve, reject) => {
     if (!API_KEY) return reject(new Error('FLASHALPHA_API_KEY not set'));
+    if (!checkBudget()) return reject(new Error(`daily call budget (${DAILY_LIMIT}) exhausted`));
+    callCount++;
     const url = `${BASE_URL}${path}`;
     const opts = {
       headers: { 'X-Api-Key': API_KEY, 'Accept': 'application/json' },
@@ -33,6 +77,9 @@ function httpGet(path) {
       res.on('end', () => {
         if (res.statusCode === 429) {
           return reject(new Error(`rate limited (429) — ${res.headers['retry-after'] || 'unknown'}`));
+        }
+        if (res.statusCode === 403) {
+          return reject(new Error(`HTTP 403 — endpoint requires a higher plan tier: ${body.slice(0, 150)}`));
         }
         if (res.statusCode !== 200) {
           return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
@@ -109,9 +156,20 @@ async function getQuote(ticker) {
 // ─── CONVERT FLASHALPHA LEVELS TO DSB GEX FORMAT ─────────────────────────────
 // Bridges FlashAlpha's levels response into the format that strategy.js expects,
 // so the rest of the codebase doesn't need to know the data source.
-function levelsToGEXFormat(levels, gexData) {
+// `spot` is used to derive regime from flip distance when the full GEX chain
+// (net_gex_label) wasn't fetched — on free tier that's the common case, since
+// the GEX chain endpoint requires Basic+ for ETFs/indexes.
+function levelsToGEXFormat(levels, gexData, spot) {
+  let isPositive;
+  if (gexData?.net_gex_label) {
+    isPositive = gexData.net_gex_label === 'positive' || (gexData.net_gex || 0) > 0;
+  } else if (spot != null && levels.gamma_flip != null) {
+    // Video 2 convention: above flip = dealers long gamma = controlled/positive.
+    isPositive = spot > levels.gamma_flip;
+  } else {
+    isPositive = true; // neutral default, avoids false EXPANSIVE bias
+  }
   const netGex = gexData?.net_gex || 0;
-  const isPositive = (gexData?.net_gex_label === 'positive') || netGex > 0;
   const regime = isPositive ? 'CONTROLLED' : 'EXPANSIVE';
 
   // Find walls from GEX strike data if available
@@ -150,29 +208,38 @@ function levelsToGEXFormat(levels, gexData) {
 }
 
 // ─── FETCH FULL GEX FOR TICKER (primary entry point) ────────────────────────
-// Fetches both levels and GEX strike data, merges into DSB format.
-// If FlashAlpha fails, returns null (caller should fall back to Alpaca).
-async function fetchGEXForTicker(ticker, expiration) {
-  try {
-    const [levels, gexData] = await Promise.all([
-      getLevels(ticker),
-      getGEX(ticker, expiration).catch(() => null),
-    ]);
-    if (!levels || !levels.gamma_flip) {
-      log(`${ticker}: no levels data`, 'WARN');
-      return null;
-    }
-    const gex = levelsToGEXFormat(levels, gexData);
-    const spot = gexData?.underlying_price || null;
-    return { gex, spot, levels };
-  } catch (e) {
-    log(`${ticker}: ${e.message}`, 'WARN');
-    return null;
+// Free tier is 5 req/day total, so this makes exactly ONE call (levels only)
+// per ticker instead of two (levels + full GEX chain) — the GEX strike chain
+// also requires Basic+ tier for ETFs/indexes (SPY/QQQ/SPX), so calling it on
+// free tier was burning budget on a request that would 403 anyway.
+// `knownSpot` (optional) lets the caller pass a spot price it already fetched
+// elsewhere (e.g. from Alpaca) so regime can be derived without an extra call.
+// Throws on failure — caller is responsible for catching and falling back.
+async function fetchGEXForTicker(ticker, expiration, knownSpot) {
+  const levels = await getLevels(ticker);
+  if (!levels || !levels.gamma_flip) {
+    throw new Error(`${ticker}: no levels data in response`);
   }
+
+  // Optional: try the full GEX chain for per-strike concentration data, but
+  // only if budget allows — never let this block the primary levels result.
+  let gexData = null;
+  if (checkBudget()) {
+    gexData = await getGEX(ticker, expiration).catch(() => null);
+  }
+
+  const spot = gexData?.underlying_price || knownSpot || null;
+  const gex = levelsToGEXFormat(levels, gexData, spot);
+  return { gex, spot, levels };
 }
 
 function isAvailable() {
   return !!API_KEY;
+}
+
+function getCallsRemainingToday() {
+  checkBudget(); // ensures the day-rollover check runs even if no call has happened yet today
+  return Math.max(0, DAILY_LIMIT - callCount);
 }
 
 module.exports = {
@@ -183,4 +250,6 @@ module.exports = {
   getQuote,
   levelsToGEXFormat,
   isAvailable,
+  setExternalLogger,
+  getCallsRemainingToday,
 };

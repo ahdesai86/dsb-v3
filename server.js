@@ -108,6 +108,12 @@ function log(msg, level = 'INFO') {
   if (logs.length > 800) logs.pop();
 }
 
+// Surface FlashAlpha's internal activity (especially failures) into the same
+// dashboard-visible log feed instead of only the raw Railway console — without
+// this, FlashAlpha errors were invisible from /api/logs and silently fell
+// back to Alpaca with no trace of why.
+FlashAlpha.setExternalLogger(log);
+
 // ─── SLEEP HELPER ─────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -378,10 +384,31 @@ async function fetchGEXForTicker(ticker) {
 const GEX_REFRESH_TIMES = ['09:25', '10:30', '12:00', '14:00'];
 let lastGEXMinute = '';
 
+// Reentrancy guard: without this, an in-flight refresh (slowed by retries on
+// a bad network day) can overlap with the next scheduled or stale-triggered
+// refresh, doubling API calls to both FlashAlpha and Alpaca and contributing
+// to 429s on unrelated calls (e.g. bar fetches) sharing the same rate budget.
+let gexRefreshInFlight = null;
+
 async function refreshGEXAll() {
+  if (gexRefreshInFlight) {
+    log('GEX refresh already in progress — joining existing call instead of starting a new one', 'WARN');
+    return gexRefreshInFlight;
+  }
+  gexRefreshInFlight = doRefreshGEXAll().finally(() => { gexRefreshInFlight = null; });
+  return gexRefreshInFlight;
+}
+
+async function doRefreshGEXAll() {
   const tickers = ['SPY', 'QQQ', 'SPX'];
   const useFlashAlpha = FlashAlpha.isAvailable();
-  log(`Refreshing GEX for ${tickers.join(', ')}... source=${useFlashAlpha ? 'FlashAlpha→Alpaca' : 'Alpaca only'}`);
+  if (useFlashAlpha) {
+    log(`Refreshing GEX for ${tickers.join(', ')}... source=FlashAlpha→Alpaca (${FlashAlpha.getCallsRemainingToday()} FlashAlpha calls left today)`);
+  } else {
+    log(`Refreshing GEX for ${tickers.join(', ')}... source=Alpaca only`);
+  }
+
+  const sourcesUsed = {};
 
   for (const ticker of tickers) {
     let result = null;
@@ -390,9 +417,11 @@ async function refreshGEXAll() {
     if (useFlashAlpha) {
       try {
         const expiry = get0DTEExpiry(ticker);
-        const faResult = await FlashAlpha.fetchGEXForTicker(ticker, expiry);
+        const knownSpot = await getSpotPrice(ticker).catch(() => null);
+        const faResult = await FlashAlpha.fetchGEXForTicker(ticker, expiry, knownSpot);
         if (faResult && faResult.gex && !faResult.gex.degenerate) {
           result = faResult;
+          sourcesUsed[ticker] = 'flashalpha';
           log(`GEX ${ticker} [FlashAlpha]: flip=${result.gex.flip} regime=${result.gex.regime} callWall=${result.gex.callWall} putWall=${result.gex.putWall} magnet=${result.gex.zeroDteMagnet}`);
         }
       } catch (e) {
@@ -405,6 +434,7 @@ async function refreshGEXAll() {
       try {
         result = await fetchGEXForTicker(ticker);
         if (result?.gex) result.gex.source = 'alpaca';
+        sourcesUsed[ticker] = 'alpaca';
         if (result?.gex?.degenerate) {
           log(`GEX ${ticker} [Alpaca]: DEGENERATE — ${result.gex.degenerateReason}`, 'WARN');
         } else {
@@ -427,9 +457,11 @@ async function refreshGEXAll() {
   const regimes = tickers.map(t => state.gexAll[t]?.regime).filter(Boolean);
   state.gexAll.multiAligned = regimes.length >= 2 && new Set(regimes).size === 1;
   state.gexAll.lastFetch    = new Date().toISOString();
-  state.gexAll.source       = useFlashAlpha ? 'flashalpha' : 'alpaca';
+  state.gexAll.sources      = sourcesUsed; // per-ticker actual source, not just "was attempted"
+  state.gexAll.source       = Object.values(sourcesUsed).some(s => s === 'flashalpha') ? 'flashalpha' : 'alpaca';
 
-  log(`GEX complete — SPY:${state.gexAll.SPY?.regime || '?'} QQQ:${state.gexAll.QQQ?.regime || '?'} SPX:${state.gexAll.SPX?.regime || '?'} aligned:${state.gexAll.multiAligned} source=${state.gexAll.source}`);
+  const srcStr = tickers.map(t => `${t}:${sourcesUsed[t] || 'none'}`).join(' ');
+  log(`GEX complete — SPY:${state.gexAll.SPY?.regime || '?'} QQQ:${state.gexAll.QQQ?.regime || '?'} SPX:${state.gexAll.SPX?.regime || '?'} aligned:${state.gexAll.multiAligned} sources=[${srcStr}]`);
 }
 
 // ─── OPTION QUOTE — CORRECT METHOD ────────────────────────────────────────────
