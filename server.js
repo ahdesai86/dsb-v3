@@ -910,13 +910,27 @@ app.get('/api/bars', async (req, res) => {
   let bars = DB.getRecentBars(ticker, timeframe, limit);
   // Cache only fills during live scans (market hours). Right after a deploy,
   // on weekends, or pre-market, fall back to a direct live fetch so the chart
-  // isn't empty — getBars() also persists the result, warming the cache.
+  // isn't empty. Unlike the shared getBars() used by the live scan loop
+  // (which omits start/end and can return zero rows pre-market since it has
+  // no completed "today" session to anchor to), this explicitly requests the
+  // last 5 calendar days so it always lands on the most recent session.
   if (!bars.length) {
     try {
-      const live = await getBars(ticker, timeframe, limit) || [];
-      // getBars() returns the Alpaca-shorthand {o,h,l,c,v,t}; normalize to
-      // match the DB query's {ts,open,high,low,close,volume} shape.
-      bars = live.map(b => ({ ts: b.t, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v }));
+      const client = getAlpaca();
+      if (client) {
+        const end = new Date();
+        const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
+        const resp = client.getBarsV2(ticker, {
+          timeframe, limit, feed: 'iex', adjustment: 'raw',
+          start: start.toISOString(), end: end.toISOString(),
+        });
+        const live = [];
+        for await (const b of resp) {
+          live.push({ ts: b.Timestamp, open: b.OpenPrice, high: b.HighPrice, low: b.LowPrice, close: b.ClosePrice, volume: b.Volume });
+        }
+        bars = live.slice(-limit);
+        if (bars.length) DB.saveBars(bars.map(b => ({ t: b.ts, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume })), ticker, timeframe);
+      }
     } catch (e) {
       log(`/api/bars live fallback failed: ${e.message}`, 'WARN');
       bars = [];
