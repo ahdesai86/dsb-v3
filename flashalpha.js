@@ -208,6 +208,13 @@ function levelsToGEXFormat(levels, gexData, spot) {
     }
   }
 
+  // Per-strike breakdown for heatmap display — only present when the full
+  // GEX chain call succeeded (budget-gated, see fetchGEXForTicker).
+  const strikes = (gexData?.strikes || []).map(s => ({
+    strike: s.strike, callGex: s.call_gex, putGex: s.put_gex, netGex: s.net_gex,
+    callOi: s.call_oi, putOi: s.put_oi,
+  }));
+
   return {
     totalGEX: netGex,
     totalVEX: 0,
@@ -224,6 +231,7 @@ function levelsToGEXFormat(levels, gexData, spot) {
     maxPain: levels.highest_oi_strike || null,
     callWall: levels.call_wall || null,
     putWall: levels.put_wall || null,
+    strikes,
     degenerate: false,
     source: 'flashalpha',
   };

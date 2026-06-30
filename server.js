@@ -900,7 +900,7 @@ app.get('/api/state', (req, res) => {
 
 app.get('/api/logs',           (req, res) => res.json(logs.slice(0, 200)));
 app.get('/api/trades',         (req, res) => res.json(DB.getRecentTrades(100)));
-app.get('/api/signals',        (req, res) => res.json(DB.getRecentSignals(50)));
+app.get('/api/signals',        (req, res) => res.json(DB.getRecentSignals(parseInt(req.query.limit) || 50)));
 app.get('/api/stats',          (req, res) => res.json({ summary: DB.getStats(), bySetup: DB.getSetupBreakdown(), daily: DB.getDailyStats(30) }));
 app.get('/api/gex-history',    (req, res) => res.json(DB.getGEXHistory(req.query.ticker || 'SPY', 48)));
 app.get('/api/bars', async (req, res) => {

@@ -129,23 +129,74 @@ function ema(values, period) {
   return out;
 }
 
-function PriceChart({bars, zones, gex, price, signal}) {
+// Mirrors strategy.js's calcDelta exactly — wick-proportion buy/sell volume
+// proxy. Positive = buying pressure (close near high), negative = selling.
+function calcDelta(open, high, low, close, volume) {
+  const range = high - low;
+  if (range < 0.0001) return 0;
+  const buyFrac  = (close - low)  / range;
+  const sellFrac = (high - close) / range;
+  return (buyFrac - sellFrac) * (volume || 0);
+}
+
+// Find the bar index whose timestamp is closest to `targetTs`. Returns null
+// if the target falls outside the visible bar window (no point plotting a
+// marker for a trade/signal that happened off-chart).
+function nearestBarIndex(bars, targetTs) {
+  if (!targetTs) return null;
+  const target = new Date(targetTs).getTime();
+  if (isNaN(target)) return null;
+  const first = new Date(bars[0].ts).getTime();
+  const last  = new Date(bars[bars.length - 1].ts).getTime();
+  const barSpan = bars.length > 1 ? (last - first) / (bars.length - 1) : 5 * 60 * 1000;
+  if (target < first - barSpan || target > last + barSpan) return null; // off-chart
+  let bestIdx = 0, bestDiff = Infinity;
+  for (let i = 0; i < bars.length; i++) {
+    const diff = Math.abs(new Date(bars[i].ts).getTime() - target);
+    if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+const TIMEFRAMES = [['1Min','1m'],['5Min','5m'],['15Min','15m'],['1Hour','1h']];
+const LOOKBACKS  = [40, 80, 160, 300];
+
+function ChartToolbar({timeframe, lookback, onTimeframe, onLookback}) {
+  const btnStyle = (active) => ({
+    padding:'4px 10px', fontSize:10, fontFamily:'inherit', cursor:'pointer', borderRadius:4,
+    background: active ? C.accentD : 'transparent',
+    border: `1px solid ${active ? C.accent+'88' : C.border}`,
+    color: active ? C.accent : C.dim, fontWeight: active ? 700 : 400,
+  });
+  return (
+    <div style={{display:'flex',gap:14,alignItems:'center',flexWrap:'wrap',marginBottom:8}}>
+      <div style={{display:'flex',gap:4,alignItems:'center'}}>
+        <span style={{fontSize:9,color:C.faint,textTransform:'uppercase',marginRight:2}}>TF</span>
+        {TIMEFRAMES.map(([tf,label]) => <button key={tf} onClick={()=>onTimeframe(tf)} style={btnStyle(timeframe===tf)}>{label}</button>)}
+      </div>
+      <div style={{display:'flex',gap:4,alignItems:'center'}}>
+        <span style={{fontSize:9,color:C.faint,textTransform:'uppercase',marginRight:2}}>Bars</span>
+        {LOOKBACKS.map(n => <button key={n} onClick={()=>onLookback(n)} style={btnStyle(lookback===n)}>{n}</button>)}
+      </div>
+    </div>
+  );
+}
+
+function PriceChart({bars, zones, gex, price, signal, trades, signals, mn, mx}) {
   if (!bars || bars.length < 5) return <div style={{padding:20,color:C.dim,fontSize:13,textAlign:'center'}}>No bar data yet — waiting for next scan</div>;
 
-  const W = 900, H = 320, padL = 46, padR = 54, padT = 10, volH = 50, chartH = H - volH - padT - 18;
+  const W = 900, H = 360, padL = 46, padR = 54, padT = 10, volH = 50, chartH = H - volH - padT - 18;
   const closes = bars.map(b => b.close);
   const ema9 = ema(closes, 9);
   const ema21 = ema(closes, 21);
+  const deltas = bars.map(b => calcDelta(b.open, b.high, b.low, b.close, b.volume));
+  const maxAbsDelta = Math.max(...deltas.map(Math.abs), 1);
 
   const all = [...(zones?.supply||[]).map(z=>({...z,t:'supply'})), ...(zones?.demand||[]).map(z=>({...z,t:'demand'}))];
-  const levelPts = [gex?.anchor, gex?.flip, gex?.wallAbove, gex?.wallBelow, price].filter(v => v != null);
-  const allHighs = bars.map(b => b.high), allLows = bars.map(b => b.low);
-  const pricePts = [...allHighs, ...allLows, ...levelPts, ...all.flatMap(z => [z.top, z.bottom])].filter(v => v != null);
-  const mn = Math.min(...pricePts) * 0.9985, mx = Math.max(...pricePts) * 1.0015;
   const rng = mx - mn || 1;
 
   const n = bars.length;
-  const candleW = Math.max(2, (W - padL - padR) / n - 2);
+  const candleW = Math.max(1.5, (W - padL - padR) / n - 2);
   const toX = i => padL + (i / (n - 1 || 1)) * (W - padL - padR);
   const toY = p => padT + ((mx - p) / rng) * chartH;
 
@@ -154,6 +205,23 @@ function PriceChart({bars, zones, gex, price, signal}) {
   const toVolY = v => (v / maxVol) * volH;
 
   const sessionVWAP = signal?.meta?.sessionVWAP;
+
+  // Trade entry/exit markers — only trades whose entry or exit time falls
+  // within the visible bar window get plotted.
+  const tradeMarkers = (trades || []).map(t => {
+    const entryIdx = nearestBarIndex(bars, t.ts);
+    const exitIdx  = t.exit_ts ? nearestBarIndex(bars, t.exit_ts) : null;
+    if (entryIdx == null && exitIdx == null) return null;
+    return { ...t, entryIdx, exitIdx };
+  }).filter(Boolean);
+
+  // Signal markers — recent evaluated signals (incl. rejected) plotted as
+  // small triangles so you can see why a setup did/didn't fire vs price.
+  const signalMarkers = (signals || []).map(s => {
+    const idx = nearestBarIndex(bars, s.ts);
+    if (idx == null || s.direction === 'NEUTRAL') return null;
+    return { ...s, idx };
+  }).filter(Boolean);
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{overflow:'visible'}}>
@@ -199,14 +267,46 @@ function PriceChart({bars, zones, gex, price, signal}) {
         </g>;
       })}
 
-      {/* Volume bars */}
+      {/* Volume bars — footprint-style: colored by buy/sell delta, not just candle direction */}
       {bars.map((b,i) => {
         const x = toX(i);
-        const up = b.close >= b.open;
+        const d = deltas[i];
+        const intensity = 0.25 + 0.55 * (Math.abs(d) / maxAbsDelta);
+        const color = d >= 0 ? C.green : C.red;
         const vh = toVolY(b.volume || 0);
-        return <rect key={'v'+i} x={x-candleW/2} y={volBaseY+volH-vh} width={candleW} height={vh} fill={up?C.green:C.red} opacity={0.35}/>;
+        return <rect key={'v'+i} x={x-candleW/2} y={volBaseY+volH-vh} width={candleW} height={vh} fill={color} opacity={intensity}/>;
       })}
-      <text x={padL} y={volBaseY-4} fill={C.faint} fontSize={8} fontFamily="monospace">VOLUME</text>
+      <text x={padL} y={volBaseY-4} fill={C.faint} fontSize={8} fontFamily="monospace">VOLUME (shaded by buy/sell delta)</text>
+
+      {/* Trade entry/exit markers */}
+      {tradeMarkers.map((t,i) => {
+        const isCall = t.direction === 'CALL';
+        const win = (t.pnl || 0) > 0;
+        const entryY = t.entryIdx != null ? toY(t.spot_at_entry || closes[t.entryIdx]) : null;
+        const exitY  = t.exitIdx  != null ? toY(closes[t.exitIdx]) : null;
+        return <g key={'tr'+i}>
+          {t.entryIdx != null && exitIdxLine(t, entryY, exitY, toX)}
+          {t.entryIdx != null && <g>
+            <polygon points={trianglePts(toX(t.entryIdx), entryY, isCall)} fill={isCall?C.green:C.red} stroke={C.bg} strokeWidth={0.5}/>
+            <text x={toX(t.entryIdx)} y={entryY + (isCall?-9:16)} fill={isCall?C.green:C.red} fontSize={7} fontFamily="monospace" textAnchor="middle">IN</text>
+          </g>}
+          {t.exitIdx != null && <g>
+            <circle cx={toX(t.exitIdx)} cy={exitY} r={4} fill={win?C.green:C.red} stroke={C.bg} strokeWidth={1}/>
+            <text x={toX(t.exitIdx)} y={exitY - 8} fill={win?C.green:C.red} fontSize={7} fontFamily="monospace" textAnchor="middle">OUT</text>
+          </g>}
+        </g>;
+      })}
+
+      {/* Signal markers — every evaluated CALL/PUT signal, tradeable or not */}
+      {signalMarkers.map((s,i) => {
+        const isCall = s.direction === 'CALL';
+        const y = toY(s.last_price || closes[s.idx]);
+        const color = !s.tradeable ? C.faint : (isCall ? C.green : C.red);
+        const yOff = isCall ? 12 : -12;
+        return <g key={'sg'+i} opacity={s.tradeable ? 0.95 : 0.5}>
+          <polygon points={trianglePts(toX(s.idx), y + yOff, !isCall)} fill={color} stroke={C.bg} strokeWidth={0.5}/>
+        </g>;
+      })}
 
       {/* Current price line */}
       {price!=null && <g><line x1={padL} y1={toY(price)} x2={W-padR} y2={toY(price)} stroke={C.text} strokeWidth={1.3} strokeDasharray="5 2"/><text x={W-padR+4} y={toY(price)+3} fill={C.text} fontSize={10} fontWeight="700" fontFamily="monospace">${price.toFixed(2)}</text></g>}
@@ -225,6 +325,76 @@ function PriceChart({bars, zones, gex, price, signal}) {
         <text key={'y'+i} x={padL-4} y={toY(p)+3} fill={C.dim} fontSize={8} fontFamily="monospace" textAnchor="end">${p.toFixed(2)}</text>
       ))}
     </svg>
+  );
+}
+
+function trianglePts(cx, cy, pointUp) {
+  const s = 5;
+  return pointUp
+    ? `${cx},${cy-s} ${cx-s},${cy+s} ${cx+s},${cy+s}`
+    : `${cx-s},${cy-s} ${cx+s},${cy-s} ${cx},${cy+s}`;
+}
+
+function exitIdxLine(t, entryY, exitY, toX) {
+  if (t.exitIdx == null || entryY == null || exitY == null) return null;
+  const win = (t.pnl || 0) > 0;
+  return <line x1={toX(t.entryIdx)} y1={entryY} x2={toX(t.exitIdx)} y2={exitY} stroke={win?C.green:C.red} strokeWidth={1} strokeDasharray="2 2" opacity={0.5}/>;
+}
+
+// ── GEX Strike Heatmap — vertical bars per strike, Y-aligned to PriceChart ───
+function GEXHeatmap({strikes, mn, mx, price}) {
+  if (!strikes || !strikes.length) return (
+    <div style={{width:140,display:'flex',alignItems:'center',justifyContent:'center',color:C.faint,fontSize:10,textAlign:'center',padding:8}}>
+      Per-strike GEX unavailable<br/>(needs FlashAlpha full chain — Basic+ tier or budget remaining)
+    </div>
+  );
+  const W = 140, H = 360, padT = 10, chartH = H - 50 - padT - 18;
+  const rng = mx - mn || 1;
+  const toY = p => padT + ((mx - p) / rng) * chartH;
+
+  const visible = strikes.filter(s => s.strike >= mn && s.strike <= mx);
+  const maxAbs = Math.max(...visible.map(s => Math.abs(s.netGex || 0)), 1);
+  const barMaxW = 60;
+  const rowH = Math.max(3, chartH / Math.max(visible.length, 1) * 0.7);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} style={{overflow:'visible'}}>
+      <text x={4} y={padT-2} fill={C.faint} fontSize={8} fontFamily="monospace">GEX BY STRIKE</text>
+      {visible.map((s,i) => {
+        const y = toY(s.strike);
+        const w = Math.max(1, (Math.abs(s.netGex||0) / maxAbs) * barMaxW);
+        const color = (s.netGex||0) >= 0 ? C.green : C.red;
+        const isATM = price != null && Math.abs(s.strike - price) < (rng / 40);
+        return <g key={i}>
+          <rect x={2} y={y-rowH/2} width={w} height={Math.max(rowH,2)} fill={color} opacity={isATM?0.9:0.55}/>
+          <text x={w+6} y={y+3} fill={isATM?C.text:C.dim} fontSize={7} fontFamily="monospace" fontWeight={isATM?700:400}>${s.strike}</text>
+        </g>;
+      })}
+      {price!=null && <line x1={0} y1={toY(price)} x2={W} y2={toY(price)} stroke={C.text} strokeWidth={1} strokeDasharray="3 2" opacity={0.6}/>}
+    </svg>
+  );
+}
+
+// ── Chart Section — combines toolbar, price chart, and GEX heatmap ──────────
+function ChartSection({bars, zones, gex, price, signal, trades, signals, timeframe, lookback, onTimeframe, onLookback}) {
+  const all = [...(zones?.supply||[]).map(z=>({...z,t:'supply'})), ...(zones?.demand||[]).map(z=>({...z,t:'demand'}))];
+  const levelPts = [gex?.anchor, gex?.flip, gex?.wallAbove, gex?.wallBelow, price].filter(v => v != null);
+  const strikePts = (gex?.strikes||[]).map(s => s.strike);
+  const barPts = (bars||[]).length ? [...bars.map(b=>b.high), ...bars.map(b=>b.low)] : [];
+  const allPts = [...barPts, ...levelPts, ...strikePts, ...all.flatMap(z => [z.top, z.bottom])].filter(v => v != null);
+  const mn = allPts.length ? Math.min(...allPts) * 0.9985 : 0;
+  const mx = allPts.length ? Math.max(...allPts) * 1.0015 : 1;
+
+  return (
+    <div>
+      <ChartToolbar timeframe={timeframe} lookback={lookback} onTimeframe={onTimeframe} onLookback={onLookback}/>
+      <div style={{display:'flex',gap:8,alignItems:'flex-start'}}>
+        <div style={{flex:1,minWidth:0}}>
+          <PriceChart bars={bars} zones={zones} gex={gex} price={price} signal={signal} trades={trades} signals={signals} mn={mn} mx={mx}/>
+        </div>
+        <GEXHeatmap strikes={gex?.strikes} mn={mn} mx={mx} price={price}/>
+      </div>
+    </div>
   );
 }
 
@@ -633,18 +803,25 @@ export default function App() {
   const [logs,setLogs]=useState([]);
   const [trades,setTrades]=useState([]);
   const [signals,setSignals]=useState([]);
+  const [chartSignals,setChartSignals]=useState([]);
   const [dbStats,setDbStats]=useState(null);
   const [bars,setBars]=useState([]);
+  const [chartTF,setChartTF]=useState('5Min');
+  const [chartLookback,setChartLookback]=useState(80);
   const [tab,setTab]=useState('dashboard');
   const [scanning,setScanning]=useState(false);
   const [err,setErr]=useState(null);
 
   const refresh=useCallback(async()=>{
     try {
-      const [s,l,t,b] = await Promise.all([api.get('/api/state'),api.get('/api/logs'),api.get('/api/trades'),api.get('/api/bars?ticker=SPY&timeframe=5Min&limit=80')]);
-      setData(s); setLogs(l); setTrades(t); setBars(b); setErr(null);
+      const [s,l,t,b,sg] = await Promise.all([
+        api.get('/api/state'), api.get('/api/logs'), api.get('/api/trades'),
+        api.get(`/api/bars?ticker=SPY&timeframe=${chartTF}&limit=${chartLookback}`),
+        api.get('/api/signals?limit=60'),
+      ]);
+      setData(s); setLogs(l); setTrades(t); setBars(b); setChartSignals(sg); setErr(null);
     } catch(e){ setErr('Server unreachable'); }
-  },[]);
+  },[chartTF,chartLookback]);
 
   const loadAnalytics=useCallback(async()=>{
     try {
@@ -720,9 +897,15 @@ export default function App() {
               <GEXPanel gexAll={gexAll} onRefresh={gexR}/>
             </Sec>
           </div>
-          <Sec title="SPY Price Chart (5m) — Candles · Volume · Zones · GEX Levels · VWAP · EMA9/21" collapsible>
+          <Sec title="SPY Price Chart — Candles · Volume(Δ) · Zones · GEX Levels+Heatmap · VWAP · EMA9/21 · Trades · Signals" collapsible>
             <div style={{padding:'8px 14px'}}>
-              <PriceChart bars={bars} zones={data?.zones} gex={data?.gexAll?.SPY} price={data?.lastSignal?.meta?.lastPrice} signal={data?.lastSignal}/>
+              <ChartSection
+                bars={bars} zones={data?.zones} gex={data?.gexAll?.SPY}
+                price={data?.lastSignal?.meta?.lastPrice} signal={data?.lastSignal}
+                trades={trades} signals={chartSignals}
+                timeframe={chartTF} lookback={chartLookback}
+                onTimeframe={setChartTF} onLookback={setChartLookback}
+              />
               <div style={{display:'flex',gap:14,marginTop:6,fontSize:11,color:C.dim,flexWrap:'wrap'}}>
                 <span><span style={{color:C.green}}>▲</span> Demand: {data?.zones?.demand?.length||0}</span>
                 <span><span style={{color:C.red}}>▼</span> Supply: {data?.zones?.supply?.length||0}</span>
@@ -733,6 +916,9 @@ export default function App() {
                 <span style={{color:C.purple}}>— VWAP</span>
                 <span style={{color:C.accent}}>— EMA9</span>
                 <span style={{color:C.orange}}>— EMA21</span>
+                <span><span style={{color:C.green}}>▲IN</span>/<span style={{color:C.green}}>●OUT</span> Trade win</span>
+                <span><span style={{color:C.red}}>▲IN</span>/<span style={{color:C.red}}>●OUT</span> Trade loss</span>
+                <span style={{color:C.dim}}>△▽ Signal (faded = not tradeable)</span>
               </div>
             </div>
           </Sec>
