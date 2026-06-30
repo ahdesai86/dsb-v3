@@ -113,7 +113,14 @@ async function getLevels(symbol) {
 
   const data = await httpGet(`/v1/exposure/levels/${symbol}`);
   setCache(cacheKey, data);
-  log(`levels ${symbol}: flip=${data.gamma_flip} callWall=${data.call_wall} putWall=${data.put_wall} magnet=${data.zero_dte_magnet}`);
+  if (data.gamma_flip == null) {
+    // Unexpected shape — dump top-level keys (and one level deep if nested)
+    // so we can see how the real payload differs from the documented schema
+    // instead of guessing blind.
+    log(`levels ${symbol}: unexpected shape, keys=[${Object.keys(data).join(',')}] raw=${JSON.stringify(data).slice(0, 400)}`, 'WARN');
+  } else {
+    log(`levels ${symbol}: flip=${data.gamma_flip} callWall=${data.call_wall} putWall=${data.put_wall} magnet=${data.zero_dte_magnet}`);
+  }
   return data;
 }
 
