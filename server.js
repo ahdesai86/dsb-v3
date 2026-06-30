@@ -903,7 +903,27 @@ app.get('/api/trades',         (req, res) => res.json(DB.getRecentTrades(100)));
 app.get('/api/signals',        (req, res) => res.json(DB.getRecentSignals(50)));
 app.get('/api/stats',          (req, res) => res.json({ summary: DB.getStats(), bySetup: DB.getSetupBreakdown(), daily: DB.getDailyStats(30) }));
 app.get('/api/gex-history',    (req, res) => res.json(DB.getGEXHistory(req.query.ticker || 'SPY', 48)));
-app.get('/api/bars',           (req, res) => res.json(DB.getRecentBars(req.query.ticker || 'SPY', req.query.timeframe || '5Min', parseInt(req.query.limit) || 100)));
+app.get('/api/bars', async (req, res) => {
+  const ticker    = req.query.ticker || 'SPY';
+  const timeframe = req.query.timeframe || '5Min';
+  const limit     = parseInt(req.query.limit) || 100;
+  let bars = DB.getRecentBars(ticker, timeframe, limit);
+  // Cache only fills during live scans (market hours). Right after a deploy,
+  // on weekends, or pre-market, fall back to a direct live fetch so the chart
+  // isn't empty — getBars() also persists the result, warming the cache.
+  if (!bars.length) {
+    try {
+      const live = await getBars(ticker, timeframe, limit) || [];
+      // getBars() returns the Alpaca-shorthand {o,h,l,c,v,t}; normalize to
+      // match the DB query's {ts,open,high,low,close,volume} shape.
+      bars = live.map(b => ({ ts: b.t, open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v }));
+    } catch (e) {
+      log(`/api/bars live fallback failed: ${e.message}`, 'WARN');
+      bars = [];
+    }
+  }
+  res.json(bars);
+});
 
 app.post('/api/scan',          async (req, res) => { await runScan(); res.json({ ok: true, signal: state.lastSignal }); });
 app.post('/api/gex-refresh',   async (req, res) => { await refreshGEXAll(); res.json({ ok: true, gex: state.gexAll }); });
