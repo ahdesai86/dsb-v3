@@ -114,6 +114,120 @@ function GEXPanel({gexAll, onRefresh}) {
   );
 }
 
+// ── Price Chart (candlesticks + volume + zones + GEX levels + EMAs) ──────────
+function ema(values, period) {
+  if (values.length < period) return values.map(() => null);
+  const k = 2 / (period + 1);
+  const out = new Array(values.length).fill(null);
+  let seed = 0;
+  for (let i = 0; i < period; i++) seed += values[i];
+  seed /= period;
+  out[period - 1] = seed;
+  for (let i = period; i < values.length; i++) {
+    out[i] = values[i] * k + out[i - 1] * (1 - k);
+  }
+  return out;
+}
+
+function PriceChart({bars, zones, gex, price, signal}) {
+  if (!bars || bars.length < 5) return <div style={{padding:20,color:C.dim,fontSize:13,textAlign:'center'}}>No bar data yet — waiting for next scan</div>;
+
+  const W = 900, H = 320, padL = 46, padR = 54, padT = 10, volH = 50, chartH = H - volH - padT - 18;
+  const closes = bars.map(b => b.close);
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+
+  const all = [...(zones?.supply||[]).map(z=>({...z,t:'supply'})), ...(zones?.demand||[]).map(z=>({...z,t:'demand'}))];
+  const levelPts = [gex?.anchor, gex?.flip, gex?.wallAbove, gex?.wallBelow, price].filter(v => v != null);
+  const allHighs = bars.map(b => b.high), allLows = bars.map(b => b.low);
+  const pricePts = [...allHighs, ...allLows, ...levelPts, ...all.flatMap(z => [z.top, z.bottom])].filter(v => v != null);
+  const mn = Math.min(...pricePts) * 0.9985, mx = Math.max(...pricePts) * 1.0015;
+  const rng = mx - mn || 1;
+
+  const n = bars.length;
+  const candleW = Math.max(2, (W - padL - padR) / n - 2);
+  const toX = i => padL + (i / (n - 1 || 1)) * (W - padL - padR);
+  const toY = p => padT + ((mx - p) / rng) * chartH;
+
+  const maxVol = Math.max(...bars.map(b => b.volume || 0), 1);
+  const volBaseY = padT + chartH + 18;
+  const toVolY = v => (v / maxVol) * volH;
+
+  const sessionVWAP = signal?.meta?.sessionVWAP;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{overflow:'visible'}}>
+      {/* Zones */}
+      {all.map((z,i) => {
+        const c = z.t === 'supply' ? C.red : C.green;
+        const yTop = toY(z.top), yBot = toY(z.bottom);
+        return <g key={'z'+i}>
+          <rect x={padL} y={yTop} width={W-padL-padR} height={Math.max(yBot-yTop,2)} fill={c+'14'} stroke={c+'40'} strokeWidth={1} strokeDasharray="3 2"/>
+          <text x={W-padR+4} y={(yTop+yBot)/2+3} fill={c} fontSize={9} fontFamily="monospace">{z.t==='supply'?'▼ supply':'▲ demand'}</text>
+        </g>;
+      })}
+
+      {/* GEX levels */}
+      {gex?.anchor!=null && <g><line x1={padL} y1={toY(gex.anchor)} x2={W-padR} y2={toY(gex.anchor)} stroke={C.accent} strokeWidth={1} strokeDasharray="4 3"/><text x={W-padR+4} y={toY(gex.anchor)+3} fill={C.accent} fontSize={9} fontFamily="monospace">Anchor ${gex.anchor}</text></g>}
+      {gex?.flip!=null && <g><line x1={padL} y1={toY(gex.flip)} x2={W-padR} y2={toY(gex.flip)} stroke={C.yellow} strokeWidth={1} strokeDasharray="2 2"/><text x={W-padR+4} y={toY(gex.flip)+3} fill={C.yellow} fontSize={9} fontFamily="monospace">Flip ${gex.flip}</text></g>}
+      {gex?.wallAbove!=null && <g><line x1={padL} y1={toY(gex.wallAbove)} x2={W-padR} y2={toY(gex.wallAbove)} stroke={C.red} strokeWidth={1} strokeDasharray="1 3"/><text x={W-padR+4} y={toY(gex.wallAbove)+3} fill={C.red} fontSize={9} fontFamily="monospace">Wall↑ ${gex.wallAbove}</text></g>}
+      {gex?.wallBelow!=null && <g><line x1={padL} y1={toY(gex.wallBelow)} x2={W-padR} y2={toY(gex.wallBelow)} stroke={C.green} strokeWidth={1} strokeDasharray="1 3"/><text x={W-padR+4} y={toY(gex.wallBelow)+3} fill={C.green} fontSize={9} fontFamily="monospace">Wall↓ ${gex.wallBelow}</text></g>}
+      {sessionVWAP!=null && <g><line x1={padL} y1={toY(sessionVWAP)} x2={W-padR} y2={toY(sessionVWAP)} stroke={C.purple} strokeWidth={1} strokeDasharray="6 2"/><text x={padL} y={toY(sessionVWAP)-3} fill={C.purple} fontSize={9} fontFamily="monospace">VWAP ${sessionVWAP.toFixed(2)}</text></g>}
+
+      {/* EMA lines */}
+      {[[ema9,C.accent,'EMA9'],[ema21,C.orange,'EMA21']].map(([series,color,label],idx) => {
+        const pts = series.map((v,i) => v!=null ? `${toX(i)},${toY(v)}` : null).filter(Boolean);
+        if (!pts.length) return null;
+        const lastIdx = series.map((v,i)=>v!=null?i:-1).filter(i=>i>=0).pop();
+        return <g key={label}>
+          <polyline points={pts.join(' ')} fill="none" stroke={color} strokeWidth={1.2} opacity={0.85}/>
+          <text x={toX(lastIdx)+4} y={toY(series[lastIdx])+(idx===0?-4:10)} fill={color} fontSize={8} fontFamily="monospace">{label}</text>
+        </g>;
+      })}
+
+      {/* Candlesticks */}
+      {bars.map((b,i) => {
+        const x = toX(i);
+        const up = b.close >= b.open;
+        const color = up ? C.green : C.red;
+        const yHigh = toY(b.high), yLow = toY(b.low);
+        const yOpen = toY(b.open), yClose = toY(b.close);
+        const bodyTop = Math.min(yOpen, yClose), bodyH = Math.max(Math.abs(yClose-yOpen), 1);
+        return <g key={i}>
+          <line x1={x} y1={yHigh} x2={x} y2={yLow} stroke={color} strokeWidth={1}/>
+          <rect x={x-candleW/2} y={bodyTop} width={candleW} height={bodyH} fill={color} opacity={0.9}/>
+        </g>;
+      })}
+
+      {/* Volume bars */}
+      {bars.map((b,i) => {
+        const x = toX(i);
+        const up = b.close >= b.open;
+        const vh = toVolY(b.volume || 0);
+        return <rect key={'v'+i} x={x-candleW/2} y={volBaseY+volH-vh} width={candleW} height={vh} fill={up?C.green:C.red} opacity={0.35}/>;
+      })}
+      <text x={padL} y={volBaseY-4} fill={C.faint} fontSize={8} fontFamily="monospace">VOLUME</text>
+
+      {/* Current price line */}
+      {price!=null && <g><line x1={padL} y1={toY(price)} x2={W-padR} y2={toY(price)} stroke={C.text} strokeWidth={1.3} strokeDasharray="5 2"/><text x={W-padR+4} y={toY(price)+3} fill={C.text} fontSize={10} fontWeight="700" fontFamily="monospace">${price.toFixed(2)}</text></g>}
+
+      {/* X axis time labels */}
+      {bars.map((b,i) => {
+        if (i % Math.max(1, Math.floor(n/8)) !== 0) return null;
+        const t = new Date(b.ts);
+        const et = new Date(t.toLocaleString('en-US',{timeZone:'America/New_York'}));
+        const label = `${et.getHours()%12||12}:${String(et.getMinutes()).padStart(2,'0')}`;
+        return <text key={'t'+i} x={toX(i)} y={H-4} fill={C.faint} fontSize={8} fontFamily="monospace" textAnchor="middle">{label}</text>;
+      })}
+
+      {/* Y axis price labels */}
+      {[mx, mn + rng*0.5, mn].map((p,i) => (
+        <text key={'y'+i} x={padL-4} y={toY(p)+3} fill={C.dim} fontSize={8} fontFamily="monospace" textAnchor="end">${p.toFixed(2)}</text>
+      ))}
+    </svg>
+  );
+}
+
 // ── Zone Viz ──────────────────────────────────────────────────────────────────
 function ZoneViz({zones, price, gex}) {
   const all=[...(zones?.supply||[]).map(z=>({...z,t:'supply'})),...(zones?.demand||[]).map(z=>({...z,t:'demand'}))];
@@ -520,14 +634,15 @@ export default function App() {
   const [trades,setTrades]=useState([]);
   const [signals,setSignals]=useState([]);
   const [dbStats,setDbStats]=useState(null);
+  const [bars,setBars]=useState([]);
   const [tab,setTab]=useState('dashboard');
   const [scanning,setScanning]=useState(false);
   const [err,setErr]=useState(null);
 
   const refresh=useCallback(async()=>{
     try {
-      const [s,l,t] = await Promise.all([api.get('/api/state'),api.get('/api/logs'),api.get('/api/trades')]);
-      setData(s); setLogs(l); setTrades(t); setErr(null);
+      const [s,l,t,b] = await Promise.all([api.get('/api/state'),api.get('/api/logs'),api.get('/api/trades'),api.get('/api/bars?ticker=SPY&timeframe=5Min&limit=80')]);
+      setData(s); setLogs(l); setTrades(t); setBars(b); setErr(null);
     } catch(e){ setErr('Server unreachable'); }
   },[]);
 
@@ -605,8 +720,24 @@ export default function App() {
               <GEXPanel gexAll={gexAll} onRefresh={gexR}/>
             </Sec>
           </div>
+          <Sec title="SPY Price Chart (5m) — Candles · Volume · Zones · GEX Levels · VWAP · EMA9/21" collapsible>
+            <div style={{padding:'8px 14px'}}>
+              <PriceChart bars={bars} zones={data?.zones} gex={data?.gexAll?.SPY} price={data?.lastSignal?.meta?.lastPrice} signal={data?.lastSignal}/>
+              <div style={{display:'flex',gap:14,marginTop:6,fontSize:11,color:C.dim,flexWrap:'wrap'}}>
+                <span><span style={{color:C.green}}>▲</span> Demand: {data?.zones?.demand?.length||0}</span>
+                <span><span style={{color:C.red}}>▼</span> Supply: {data?.zones?.supply?.length||0}</span>
+                <span style={{color:C.accent}}>— Anchor</span>
+                <span style={{color:C.yellow}}>- - Flip</span>
+                <span style={{color:C.red}}>·· Wall↑</span>
+                <span style={{color:C.green}}>·· Wall↓</span>
+                <span style={{color:C.purple}}>— VWAP</span>
+                <span style={{color:C.accent}}>— EMA9</span>
+                <span style={{color:C.orange}}>— EMA21</span>
+              </div>
+            </div>
+          </Sec>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-            <Sec title="S&D Zone Map (15m) + GEX Levels" collapsible>
+            <Sec title="S&D Zone Map (15m) + GEX Levels" collapsible defaultOpen={false}>
               <div style={{padding:'8px 14px'}}>
                 <ZoneViz zones={data?.zones} price={data?.lastSignal?.meta?.lastPrice} gex={data?.gexAll?.SPY}/>
                 <div style={{display:'flex',gap:14,marginTop:6,fontSize:11,color:C.dim}}>

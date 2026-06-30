@@ -450,6 +450,16 @@ const saveBars = safe((bars, ticker, timeframe) => {
   `).run(ticker, timeframe);
 }, undefined);
 
+const getRecentBars = safe(
+  (ticker = 'SPY', timeframe = '5Min', limit = 100) =>
+    db.prepare(`
+      SELECT ts, open, high, low, close, volume FROM bars
+      WHERE ticker = ? AND timeframe = ?
+      ORDER BY ts DESC LIMIT ?
+    `).all(ticker, timeframe, limit).reverse(),
+  []
+);
+
 // ─── QUERY HELPERS ────────────────────────────────────────────────────────────
 
 const getRecentSignals = safe(
@@ -557,6 +567,7 @@ module.exports = {
   updateTradeWatermark,
   saveGEXSnap,
   saveBars,
+  getRecentBars,
   getRecentSignals,
   getRecentTrades,
   getOpenTrades,
