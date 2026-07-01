@@ -1060,6 +1060,35 @@ app.listen(ENV.PORT, () => {
   scheduleDailyReset();
   schedulePositionPoll();
 
+  // Restore any open positions from the DB into in-memory state.
+  // Without this, a redeploy during a live trade orphans the position —
+  // the DB still shows it OPEN but the monitor loop never sees it.
+  const openTrades = DB.getOpenTrades();
+  if (openTrades.length) {
+    openTrades.forEach(t => {
+      state.positions[t.option_symbol] = {
+        id: t.trade_id, clientOrderId: t.trade_id,
+        symbol: t.option_symbol, underlying: 'SPY',
+        direction: t.direction, contracts: t.contracts,
+        entryPremium: t.premium, currentPrice: t.premium,
+        strike: t.strike, expiry: t.expiry, spot: t.spot_at_entry,
+        stopPrice: t.stop_price, atrStop: t.atr_stop,
+        tp1Price: t.tp1_price, tp2Price: t.tp2_price,
+        gexTP1: t.gex_tp1, zeroDteMagnet: null,
+        setupType: t.setup_type, grade: t.grade, confidence: t.confidence,
+        setupDesc: t.setup_desc, delta: t.delta,
+        gexRegime: t.gex_regime, gexFlags: JSON.parse(t.gex_flags || '[]'),
+        tp1Hit: false, status: 'OPEN', entryTime: t.ts,
+        unrealizedPnL: 0, pnlPct: 0, signalId: t.signal_id,
+        maxPremium: t.max_premium || t.premium,
+        minPremium: t.min_premium || t.premium,
+        confluenceSummary: t.confluence_summary || '',
+        restoredFromDB: true,
+      };
+    });
+    log(`Restored ${openTrades.length} open position(s) from DB: ${openTrades.map(t=>t.option_symbol).join(', ')}`);
+  }
+
   // Run startup data fetches async, AFTER the port is already listening.
   // Wrapped in its own try/catch so a slow/broken Alpaca connection at
   // boot cannot prevent the health check from passing.
