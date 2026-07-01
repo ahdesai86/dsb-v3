@@ -378,12 +378,16 @@ function GEXHeatmap({strikes, mn, mx, price}) {
 // ── Chart Section — combines toolbar, price chart, and GEX heatmap ──────────
 function ChartSection({bars, zones, gex, price, signal, trades, signals, timeframe, lookback, onTimeframe, onLookback}) {
   const all = [...(zones?.supply||[]).map(z=>({...z,t:'supply'})), ...(zones?.demand||[]).map(z=>({...z,t:'demand'}))];
-  const levelPts = [gex?.anchor, gex?.flip, gex?.wallAbove, gex?.wallBelow, price].filter(v => v != null);
-  const strikePts = (gex?.strikes||[]).map(s => s.strike);
+  // Price domain is derived only from candle OHLC + current price — NOT GEX levels.
+  // GEX levels (flip at $505, anchor at $747) can be far from current price and
+  // would collapse the candle area into a thin unreadable band.
   const barPts = (bars||[]).length ? [...bars.map(b=>b.high), ...bars.map(b=>b.low)] : [];
-  const allPts = [...barPts, ...levelPts, ...strikePts, ...all.flatMap(z => [z.top, z.bottom])].filter(v => v != null);
+  const pricePts = price ? [price] : [];
+  const zonePts = all.flatMap(z => [z.top, z.bottom]);
+  const allPts = [...barPts, ...pricePts, ...zonePts].filter(v => v != null);
   const mn = allPts.length ? Math.min(...allPts) * 0.9985 : 0;
   const mx = allPts.length ? Math.max(...allPts) * 1.0015 : 1;
+  // Strike heatmap uses its own clamped domain — no changes needed there.
 
   return (
     <div>

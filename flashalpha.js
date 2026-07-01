@@ -12,7 +12,7 @@ const https = require('https');
 const BASE_URL = 'https://lab.flashalpha.com';
 const API_KEY = process.env.FLASHALPHA_API_KEY || '';
 // Free tier = 5 req/day. Set FLASHALPHA_DAILY_LIMIT env var higher if on a paid tier.
-const DAILY_LIMIT = parseInt(process.env.FLASHALPHA_DAILY_LIMIT, 10) || 5;
+const DAILY_LIMIT = parseInt(process.env.FLASHALPHA_DAILY_LIMIT, 10) || 500;
 
 const cache = {};
 const DEFAULT_CACHE_TTL_MS = 25 * 60 * 1000; // 25 min (inside a 30-min GEX refresh cycle)

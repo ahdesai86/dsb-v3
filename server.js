@@ -297,27 +297,25 @@ async function fetchGEXForTicker(ticker) {
   }
 
   // 2) Snapshots — greeks (gamma, vanna) per symbol
-  // Try 'opra' feed first (has greeks), fall back to 'indicative'
+  // Use 'indicative' feed directly — 'opra' requires a paid subscription and
+  // always 403s on paper accounts, generating noise on every GEX refresh cycle.
   let chainData;
-  for (const feed of ['opra', 'indicative']) {
-    try {
-      chainData = await withRetry(
-        () => client.getOptionChain(underlying, {
-          expiration_date: expiry,
-          feed,
-          totalLimit:      500,
-        }),
-        `getOptionChain(${underlying}, feed=${feed})`
-      );
-      if (chainData && chainData.length >= 5) {
-        const sample = chainData[0];
-        const hasGreeks = !!(sample?.Greeks || sample?.greeks || sample?.ImpliedVolatility);
-        log(`GEX ${ticker}: feed=${feed} returned ${chainData.length} snaps, hasGreeks=${hasGreeks}`);
-        if (hasGreeks) break;
-      }
-    } catch (e) {
-      log(`GEX ${ticker}: feed=${feed} failed: ${e.message}`, 'WARN');
+  try {
+    chainData = await withRetry(
+      () => client.getOptionChain(underlying, {
+        expiration_date: expiry,
+        feed: 'indicative',
+        totalLimit: 500,
+      }),
+      `getOptionChain(${underlying}, feed=indicative)`
+    );
+    if (chainData && chainData.length >= 5) {
+      const sample = chainData[0];
+      const hasGreeks = !!(sample?.Greeks || sample?.greeks || sample?.ImpliedVolatility);
+      log(`GEX ${ticker}: feed=indicative returned ${chainData.length} snaps, hasGreeks=${hasGreeks}`);
     }
+  } catch (e) {
+    log(`GEX ${ticker}: feed=indicative failed: ${e.message}`, 'WARN');
   }
 
   if (!chainData || chainData.length < 5) {
