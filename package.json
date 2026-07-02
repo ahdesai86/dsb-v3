@@ -1,6 +1,6 @@
 {
   "name": "dsb-v3",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Sowmya S&D + Delta + Dealer's Edge GEX — SPY/QQQ/SPX Options Bot — No TradingView",
   "main": "server.js",
   "scripts": {

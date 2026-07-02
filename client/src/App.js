@@ -861,7 +861,7 @@ export default function App() {
       {/* Header */}
       <div style={{background:C.panel,borderBottom:`1px solid ${C.border}`,padding:'12px 20px',display:'flex',alignItems:'center',gap:14,flexWrap:'wrap'}}>
         <div>
-          <div style={{fontSize:16,fontWeight:900,color:C.accent,letterSpacing:-0.3}}>◈ DSB v3 — S&D + DELTA + GEX <span style={{fontSize:11,color:C.purple,fontWeight:700,marginLeft:6,padding:'1px 8px',background:C.purple+'18',border:`1px solid ${C.purple}44`,borderRadius:4}}>FlashAlpha Branch</span></div>
+          <div style={{fontSize:16,fontWeight:900,color:C.accent,letterSpacing:-0.3}}>◈ DSB v3 — S&D + DELTA + GEX <span style={{fontSize:11,color:C.purple,fontWeight:700,marginLeft:6,padding:'1px 8px',background:C.purple+'18',border:`1px solid ${C.purple}44`,borderRadius:4}}>FlashAlpha Branch</span><span style={{fontSize:10,color:C.dim,fontWeight:500,marginLeft:8}}>v3.1.0</span></div>
           <div style={{fontSize:9,color:C.dim,letterSpacing:1.5,marginTop:2}}>ALPACA NATIVE · FLASHALPHA GEX · SPY+QQQ+SPX · SQLITE</div>
         </div>
         <div style={{display:'flex',gap:6,flexWrap:'wrap',marginLeft:8}}>
