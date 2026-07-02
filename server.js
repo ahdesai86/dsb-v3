@@ -61,7 +61,7 @@ const ENV = {
   TIERED_SIZING:      process.env.TIERED_SIZING       !== 'false',
   AUTO_TRADE:         process.env.AUTO_TRADE          === 'true',
   MIN_CONFIDENCE:     parseInt(process.env.MIN_CONFIDENCE       || '65'),
-  FORCE_CLOSE_ET:     process.env.FORCE_CLOSE_ET                || '15:45',
+  FORCE_CLOSE_ET:     process.env.FORCE_CLOSE_ET                || '15:25',
   GEX_REFRESH_MINS:   parseInt(process.env.GEX_REFRESH_MINS     || '30'),
   SCAN_INTERVAL_MINS: parseInt(process.env.SCAN_INTERVAL_MINS   || '5'),
   MAX_POSITIONS:      parseInt(process.env.MAX_POSITIONS        || '1'),
@@ -233,6 +233,22 @@ function get0DTEExpiry(ticker) {
     else if (day === 6) d.setDate(d.getDate() + 2);
   } else {
     // SPY/QQQ: 0DTE on Mon(1), Wed(3), Fri(5)
+    const valid = [1, 3, 5];
+    while (!valid.includes(d.getDay())) d.setDate(d.getDate() + 1);
+  }
+  return d.toISOString().split('T')[0];
+}
+
+// Next valid SPY/QQQ expiry AFTER today (Mon/Wed/Fri schedule).
+// Used for 1DTE entries at 14:30+ ET to avoid theta decay on 0DTE contracts.
+function get1DTEExpiry(ticker) {
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  d.setDate(d.getDate() + 1); // start from tomorrow
+  if (ticker === 'SPX' || ticker === 'SPXW') {
+    // SPXW expires every weekday
+    while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
+  } else {
+    // SPY/QQQ: Mon(1), Wed(3), Fri(5)
     const valid = [1, 3, 5];
     while (!valid.includes(d.getDay())) d.setDate(d.getDate() + 1);
   }
@@ -481,18 +497,28 @@ async function getOptionMidPrice(optionSymbol) {
 }
 
 // ─── OPTION FINDER ────────────────────────────────────────────────────────────
-async function findOption(symbol, direction) {
+// expiryOverride: pass get1DTEExpiry() result for late-session entries to avoid
+// theta decay — a 1DTE contract retains meaningful premium overnight.
+async function findOption(symbol, direction, expiryOverride) {
   const client = getAlpaca();
   if (!client) return null;
   try {
     const spot   = await getSpotPrice(symbol);
-    const expiry = get0DTEExpiry(symbol);
-    const strike = Math.round(spot);
+    const expiry = expiryOverride || get0DTEExpiry(symbol);
+    // For 1DTE, pick a strike slightly OTM using GEX anchor when available,
+    // otherwise ATM. The anchor is the highest-gamma strike — the most likely
+    // price magnet by next expiry, so it's a natural target strike.
+    const gexAnchor = state.gexAll?.SPY?.anchor;
+    const strike = expiryOverride && gexAnchor
+      ? (direction === 'CALL'
+          ? Math.ceil(Math.max(Math.round(spot), gexAnchor))
+          : Math.floor(Math.min(Math.round(spot), gexAnchor)))
+      : Math.round(spot);
     const expStr = expiry.replace(/-/g, '').slice(2);  // YYMMDD
     const strStr = (strike * 1000).toString().padStart(8, '0');
     const optType = direction === 'CALL' ? 'C' : 'P';
     const optSymbol = `${symbol}${expStr}${optType}${strStr}`;
-    return { symbol: optSymbol, strike, expiry, type: optType, spot };
+    return { symbol: optSymbol, strike, expiry, type: optType, spot, is1DTE: !!expiryOverride };
   } catch (e) {
     log(`findOption: ${e.message}`, 'ERROR');
     return null;
@@ -512,7 +538,7 @@ function sizeContracts(premium, grade, cfg) {
 }
 
 // ─── ENTRY ────────────────────────────────────────────────────────────────────
-async function placeEntry(signal, signalId) {
+async function placeEntry(signal, signalId, use1DTE = false) {
   const cfg = state.config;
   if (!cfg.AUTO_TRADE) {
     log(`[SIGNAL] ${signal.direction} ${signal.confidence}% ${signal.grade} ${signal.setup?.type} — AUTO_TRADE OFF`);
@@ -528,7 +554,9 @@ async function placeEntry(signal, signalId) {
   const client = getAlpaca();
   if (!client) return null;
 
-  const opt = await findOption('SPY', signal.direction);
+  const expiryOverride = use1DTE ? get1DTEExpiry('SPY') : undefined;
+  if (use1DTE) log(`1DTE mode — using expiry ${expiryOverride} (signal at 14:30+ ET, protecting against theta decay)`);
+  const opt = await findOption('SPY', signal.direction, expiryOverride);
   if (!opt) return null;
 
   let premium;
@@ -591,6 +619,7 @@ async function placeEntry(signal, signalId) {
       gexRegime: signal.meta.gexRegime, gexFlags: signal.meta.gexFlags,
       tp1Hit: false, status: 'OPEN', entryTime: new Date().toISOString(),
       unrealizedPnL: 0, pnlPct: 0, signalId,
+      is1DTE: opt.is1DTE || false,
       // Running high/low watermark on the option premium while held —
       // tracks the best and worst price seen so far, independent of where
       // it currently sits. Updated every monitor poll (every 30 seconds).
@@ -660,6 +689,17 @@ async function closePosition(symbol, reason, partial = false, partialPct = 1.0) 
     }
   } catch (e) {
     log(`closePosition [${reason}] ${symbol}: ${e.message}`, 'ERROR');
+    // 403 = Alpaca rejected the order (contract expired / halted / no longer tradeable).
+    // Mark the position as EXPIRED in the DB so it doesn't sit open forever and
+    // doesn't get restored as a live position on next startup.
+    const isExpired = e.message?.includes('403') || e.message?.toLowerCase().includes('expired');
+    if (isExpired) {
+      const pnl = (0 - pos.entryPremium) * pos.contracts * 100;
+      const label = getExitStrategyLabel('EXPIRED');
+      DB.saveTradeExit(pos.clientOrderId, 0, pos.entryPremium, 'EXPIRED', pos.entryTime, pos.contracts, pos.maxPremium, pos.minPremium, label);
+      delete state.positions[symbol];
+      log(`EXPIRED [${reason}] ${symbol}: wrote DB record — full premium loss $${Math.abs(pnl).toFixed(2)}`, 'WARN');
+    }
   }
 }
 
@@ -760,10 +800,19 @@ async function runScan() {
     // FIX 4: Fetch bars with retry (staggered — 15m first, then 5m)
     const bars15m = await getBars('SPY', '15Min', 55);
     await sleep(500);  // small gap to avoid concurrent rate limit
-    const bars5m  = await getBars('SPY', '5Min', 65);
+    let bars5m  = await getBars('SPY', '5Min', 65);
 
+    // Fix 5: on 429 or empty live bars, fall back to DB cache rather than
+    // skipping the scan entirely — cached bars are slightly stale but still
+    // valid for zone detection and most signal conditions.
     if (!bars5m || bars5m.length < 10) {
-      log('Insufficient 5m bar data — skipping scan', 'WARN'); return;
+      const cached = DB.getRecentBars('SPY', '5Min', 65);
+      if (cached && cached.length >= 10) {
+        bars5m = cached.map(b => ({ o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume, t: b.ts }));
+        log('5m bar fetch failed — using DB cache for this scan', 'WARN');
+      } else {
+        log('Insufficient 5m bar data (live + cache) — skipping scan', 'WARN'); return;
+      }
     }
 
     // FIX 5: Lower minimum bar threshold — 15m bars may be sparse at open
@@ -815,7 +864,14 @@ async function runScan() {
       log(`  ↳ Confluence: ${signal.meta.confluenceSummary}`);
     }
 
-    if (signal.tradeable) await placeEntry(signal, signalId);
+    if (signal.tradeable) {
+      // Signals at 14:30 ET or later use 1DTE contracts to avoid theta decay.
+      // A 0DTE option entered at 14:30 has ~75 minutes to expiry — near-zero
+      // extrinsic value and prone to expiring worthless on any pause in momentum.
+      // 1DTE retains meaningful premium overnight and can be managed next session.
+      const use1DTE = etH > 14 || (etH === 14 && etM >= 30);
+      await placeEntry(signal, signalId, use1DTE);
+    }
 
   } catch (e) {
     log(`Scan error: ${e.message}`, 'ERROR');
@@ -828,8 +884,16 @@ function scheduleForceClose() {
   setInterval(() => {
     const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
     if (et.getHours() === h && et.getMinutes() === m) {
-      log(`FORCE CLOSE all positions at ${state.config.FORCE_CLOSE_ET} ET`);
-      Object.keys(state.positions).forEach(sym => closePosition(sym, 'FORCE_CLOSE_EOD'));
+      const syms = Object.keys(state.positions);
+      const zeroDTE = syms.filter(s => !state.positions[s].is1DTE);
+      const oneDTE  = syms.filter(s =>  state.positions[s].is1DTE);
+      if (zeroDTE.length) {
+        log(`FORCE CLOSE ${zeroDTE.length} 0DTE position(s) at ${state.config.FORCE_CLOSE_ET} ET`);
+        zeroDTE.forEach(sym => closePosition(sym, 'FORCE_CLOSE_EOD'));
+      }
+      if (oneDTE.length) {
+        log(`Skipping FORCE CLOSE for ${oneDTE.length} 1DTE position(s) — they expire tomorrow: ${oneDTE.join(', ')}`);
+      }
     }
   }, 60000);
 }
@@ -1063,9 +1127,19 @@ app.listen(ENV.PORT, () => {
   // Restore any open positions from the DB into in-memory state.
   // Without this, a redeploy during a live trade orphans the position —
   // the DB still shows it OPEN but the monitor loop never sees it.
+  const todayET = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })).toISOString().split('T')[0];
   const openTrades = DB.getOpenTrades();
   if (openTrades.length) {
     openTrades.forEach(t => {
+      // Any position whose option already expired should be marked EXPIRED in DB
+      // and NOT restored to the live monitor — it can't be closed or priced.
+      if (t.expiry && t.expiry < todayET) {
+        const pnl = (0 - t.premium) * t.contracts * 100;
+        const label = getExitStrategyLabel('EXPIRED');
+        DB.saveTradeExit(t.trade_id, 0, t.premium, 'EXPIRED', t.ts, t.contracts, t.max_premium || t.premium, t.min_premium || t.premium, label);
+        log(`Startup: marked expired position ${t.option_symbol} (expiry ${t.expiry}) as EXPIRED — $${Math.abs(pnl).toFixed(2)} loss`, 'WARN');
+        return;
+      }
       state.positions[t.option_symbol] = {
         id: t.trade_id, clientOrderId: t.trade_id,
         symbol: t.option_symbol, underlying: 'SPY',
@@ -1083,6 +1157,7 @@ app.listen(ENV.PORT, () => {
         maxPremium: t.max_premium || t.premium,
         minPremium: t.min_premium || t.premium,
         confluenceSummary: t.confluence_summary || '',
+        is1DTE: t.expiry > todayET,
         restoredFromDB: true,
       };
     });

@@ -768,7 +768,8 @@ const EXIT_STRATEGY_LABELS = {
   SOWMYA_EXIT:     'Opposing signal — opposite trapped-participant pattern appeared (Sowmya exit rule)',
   TP1:             'Take-profit 1 — partial close at first target, stop trailed to breakeven',
   TP2:             'Take-profit 2 — full close at second target',
-  FORCE_CLOSE_EOD: 'End-of-day force close — held past the configured force-close time',
+  FORCE_CLOSE_EOD: 'End-of-day force close — held past the configured force-close time (0DTE only)',
+  EXPIRED:         'Option expired worthless — Alpaca rejected close order at/near expiry; full premium loss',
   MAGNET_PIN:      '0DTE magnet pin exit — underlying reached the FlashAlpha zero-DTE magnet strike in profit late in session',
   MANUAL:          'Manually closed from the dashboard',
 };
@@ -911,11 +912,20 @@ function evaluateSignal({ bars15m, bars5m, gexData, etHour, etMinute, priorDayCl
   // would self-block a brand-new entry signal before any position even exists.
   // The Sowmya opposing-signal exit rule is correctly applied only against
   // OPEN positions (see monitorPositions() in server.js), not at entry time.
+  // B-grade setups (SETUP_3/SETUP_4 without confirming delta) require all-3
+  // tickers aligned — they lack the trapped-participant confirmation that makes
+  // A/A+ grades robust enough to trade into a mixed dealer environment.
+  // A and A+ can fire on SPY-only alignment (multi-ticker is a bonus, not a gate).
+  const multiOk = setup?.grade !== 'B' || gexData?.multiTickerAligned === true;
+
   result.tradeable = (
     zoneHit.hit   &&
     setup !== null &&
-    result.confidence >= minConfidence
+    result.confidence >= minConfidence &&
+    multiOk
   );
+
+  if (!multiOk) result.rejectReasons.push('B-grade requires all-3-ticker alignment (SPY+QQQ+SPX) — use A/A+ setup or wait for alignment');
 
   if (!zoneHit.hit) result.rejectReasons.push('Zone miss — no S&D zone present');
 
